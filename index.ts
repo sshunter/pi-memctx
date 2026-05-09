@@ -2976,8 +2976,10 @@ ${content}
 `;
 }
 
-const SAVE_QUEUE_DIR = path.join(process.env.HOME ?? process.env.USERPROFILE ?? ".", ".cache", "pi-memctx");
-const SAVE_QUEUE_PATH = path.join(SAVE_QUEUE_DIR, "save-queue.json");
+function saveQueuePath(): string {
+	return process.env.MEMCTX_SAVE_QUEUE_PATH
+		?? path.join(process.env.HOME ?? process.env.USERPROFILE ?? ".", ".cache", "pi-memctx", "save-queue.json");
+}
 
 function sensitivePatternHit(title: string, content: string): boolean {
 	const sensitivePatterns = [
@@ -2992,7 +2994,7 @@ function sensitivePatternHit(title: string, content: string): boolean {
 
 function readSaveQueue(): MemoryCandidate[] {
 	try {
-		const raw = readFileSafe(SAVE_QUEUE_PATH);
+		const raw = readFileSafe(saveQueuePath());
 		if (!raw) return [];
 		const parsed = JSON.parse(raw);
 		return Array.isArray(parsed) ? parsed : [];
@@ -3002,8 +3004,9 @@ function readSaveQueue(): MemoryCandidate[] {
 }
 
 function writeSaveQueue(queue: MemoryCandidate[]) {
-	fs.mkdirSync(SAVE_QUEUE_DIR, { recursive: true });
-	fs.writeFileSync(SAVE_QUEUE_PATH, JSON.stringify(queue.slice(-100), null, 2) + "\n", "utf-8");
+	const filePath = saveQueuePath();
+	fs.mkdirSync(path.dirname(filePath), { recursive: true });
+	fs.writeFileSync(filePath, JSON.stringify(queue.slice(-100), null, 2) + "\n", "utf-8");
 }
 
 function enqueueMemoryCandidate(candidate: MemoryCandidate) {
@@ -3011,6 +3014,59 @@ function enqueueMemoryCandidate(candidate: MemoryCandidate) {
 	const queue = readSaveQueue();
 	const duplicate = queue.some((item) => item.pack === normalizedCandidate.pack && slugify(normalizeNoteTitle(item.type, item.title)) === slugify(normalizedCandidate.title));
 	if (!duplicate) writeSaveQueue([...queue, normalizedCandidate]);
+}
+
+function queuedMemoryCandidates(pack = activePack): MemoryCandidate[] {
+	const queue = readSaveQueue();
+	return pack ? queue.filter((candidate) => candidate.pack === pack) : queue;
+}
+
+function resolveQueuedMemoryCandidate(selector: string, pack = activePack): { candidate: MemoryCandidate; queueIndex: number; displayIndex: number } | null {
+	const trimmed = selector.trim();
+	if (!trimmed) return null;
+	const queue = readSaveQueue();
+	const scoped = queue
+		.map((candidate, queueIndex) => ({ candidate, queueIndex }))
+		.filter((item) => !pack || item.candidate.pack === pack);
+	if (/^\d+$/.test(trimmed)) {
+		const displayIndex = Number(trimmed);
+		const item = scoped[displayIndex - 1];
+		return item ? { ...item, displayIndex } : null;
+	}
+	const matches = scoped.filter((item) => item.candidate.id === trimmed || item.candidate.id.startsWith(trimmed));
+	if (matches.length !== 1) return null;
+	return { ...matches[0], displayIndex: scoped.findIndex((item) => item.queueIndex === matches[0].queueIndex) + 1 };
+}
+
+function removeQueuedMemoryCandidate(selector: string, pack = activePack): MemoryCandidate | null {
+	const resolved = resolveQueuedMemoryCandidate(selector, pack);
+	if (!resolved) return null;
+	const queue = readSaveQueue();
+	const [removed] = queue.splice(resolved.queueIndex, 1);
+	writeSaveQueue(queue);
+	return removed ?? null;
+}
+
+function clearQueuedMemoryCandidates(pack = activePack): number {
+	const queue = readSaveQueue();
+	const next = pack ? queue.filter((candidate) => candidate.pack !== pack) : [];
+	const removed = queue.length - next.length;
+	writeSaveQueue(next);
+	return removed;
+}
+
+function formatQueuedMemoryCandidate(candidate: MemoryCandidate, index: number, includePreview = false): string {
+	const confidence = Math.round(candidate.confidence * 100);
+	const tags = candidate.tags.length ? candidate.tags.join(", ") : "none";
+	const lines = [
+		`[${index}] ${candidate.type} · ${confidence}% · ${candidate.title}`,
+		`    id: ${candidate.id}`,
+		`    reason: ${candidate.reason}`,
+		`    created: ${candidate.createdAt}`,
+		`    tags: ${tags}`,
+	];
+	if (includePreview) lines.push(`    preview: ${truncate(candidate.content.replace(/\s+/g, " ").trim(), 420)}`);
+	return lines.join("\n");
 }
 
 function exactContextTargetNote(candidate: MemoryCandidate): string | null {
@@ -4541,7 +4597,7 @@ export default function (pi: ExtensionAPI) {
 				const queueCount = readSaveQueue().length;
 				const warnings = [
 					!qmdAvailable ? "qmd unavailable; using grep fallback" : "",
-					queueCount > 0 ? `${queueCount} memory candidate${queueCount === 1 ? "" : "s"} pending review` : "",
+					queueCount > 0 ? `${queueCount} memory candidate${queueCount === 1 ? "" : "s"} pending review; run /memctx-review` : "",
 				].filter(Boolean);
 				if (warnings.length > 0) ctx.ui.notify(`memctx doctor: ${warnings.join("; ")}`, "warning");
 			}
@@ -4744,7 +4800,7 @@ export default function (pi: ExtensionAPI) {
 				`Retrieval: ${retrievalPolicy} (${retrievalLatencyBudgetMs}ms)`,
 				`Gateway judge: ${gatewayJudgeMode}`,
 				`Context: ${contextPipeline}/${contextMode}, ~${contextTokenBudget} tokens, ${contextMaxItems} items`,
-				`Save queue: ${readSaveQueue().length} pending`,
+				`Save queue: ${queuedMemoryCandidates(activePack).length} pending${queuedMemoryCandidates(activePack).length > 0 ? " — run /memctx-review" : ""}`,
 				`qmd bin: ${qmdStatus.bin ?? "<none>"}`,
 				`qmd version: ${qmdStatus.version ?? "<unknown>"}`,
 				`qmd error: ${qmdStatus.error ?? "<none>"}`,
@@ -4848,6 +4904,7 @@ export default function (pi: ExtensionAPI) {
 				"Daily commands:",
 				"  /memctx-init      Create/update memory for this workspace",
 				"  /memctx-status    Show workspace memory status",
+				"  /memctx-review    Review queued memory candidates",
 				"  /memctx-refresh   Refresh workspace memory",
 				"  /memctx-doctor    Diagnose setup",
 				"",
@@ -4861,6 +4918,99 @@ export default function (pi: ExtensionAPI) {
 		handler: async (args, ctx) => {
 			const advanced = /--advanced|advanced/i.test(args ?? "");
 			ctx.ui.notify(workspaceStatusLines(ctx, advanced).join("\n"), "info");
+		},
+	});
+
+	pi.registerCommand("memctx-review", {
+		description: "Review queued memory candidates. Usage: /memctx-review [--list|approve <id|index>|reject <id|index>|clear|path]",
+		handler: async (args, ctx) => {
+			const rawParts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+			const action = (rawParts[0] ?? "--list").toLowerCase();
+			const selector = rawParts[1] ?? "";
+			if (["path", "--path"].includes(action)) {
+				ctx.ui.notify(`Memory candidate queue: ${saveQueuePath()}`, "info");
+				return;
+			}
+			if (!activePack) {
+				ctx.ui.notify("memctx: No active workspace memory. Run /memctx-init first, or use /memctx-review path for manual queue inspection.", "warning");
+				return;
+			}
+
+			if (["approve", "save"].includes(action)) {
+				if (!selector) {
+					ctx.ui.notify("Usage: /memctx-review approve <id|index>", "warning");
+					return;
+				}
+				const resolved = resolveQueuedMemoryCandidate(selector, activePack);
+				if (!resolved) {
+					ctx.ui.notify(`memctx: No queued memory candidate matched \"${selector}\" for ${activePack}.`, "warning");
+					return;
+				}
+				try {
+					const saved = saveMemoryCandidate(resolved.candidate);
+					removeQueuedMemoryCandidate(resolved.candidate.id, activePack);
+					if (qmdAvailable) qmdEmbed(qmdCollection, activePackPath).catch(() => {});
+					ctx.ui.notify([
+						`Saved queued memory candidate: ${saved.action === "updated" ? "updated" : "created"} ${saved.rel}`,
+						`Type: ${resolved.candidate.type}`,
+						`Title: ${resolved.candidate.title}`,
+						`Remaining queue: ${queuedMemoryCandidates(activePack).length} pending`,
+					].join("\n"), "info");
+				} catch (err) {
+					ctx.ui.notify(`memctx: Could not save queued candidate: ${err instanceof Error ? err.message : String(err)}`, "error");
+				}
+				return;
+			}
+
+			if (["reject", "discard", "remove", "delete"].includes(action)) {
+				if (!selector) {
+					ctx.ui.notify("Usage: /memctx-review reject <id|index>", "warning");
+					return;
+				}
+				const removed = removeQueuedMemoryCandidate(selector, activePack);
+				if (!removed) {
+					ctx.ui.notify(`memctx: No queued memory candidate matched \"${selector}\" for ${activePack}.`, "warning");
+					return;
+				}
+				ctx.ui.notify([
+					`Discarded queued memory candidate: ${removed.type}: ${removed.title}`,
+					`Remaining queue: ${queuedMemoryCandidates(activePack).length} pending`,
+				].join("\n"), "info");
+				return;
+			}
+
+			if (["clear", "--clear"].includes(action)) {
+				const count = queuedMemoryCandidates(activePack).length;
+				if (count === 0) {
+					ctx.ui.notify(`No queued memory candidates for ${activePack}.`, "info");
+					return;
+				}
+				const confirmed = await ctx.ui.confirm("Discard queued memory candidates?", `Discard all ${count} queued memory candidate${count === 1 ? "" : "s"} for ${activePack}?`);
+				if (!confirmed) {
+					ctx.ui.notify("memctx: Review queue unchanged.", "info");
+					return;
+				}
+				const removed = clearQueuedMemoryCandidates(activePack);
+				ctx.ui.notify(`Discarded ${removed} queued memory candidate${removed === 1 ? "" : "s"} for ${activePack}.`, "info");
+				return;
+			}
+
+			if (!["--list", "list", ""].includes(action)) {
+				ctx.ui.notify("Usage: /memctx-review [--list|approve <id|index>|reject <id|index>|clear|path]", "warning");
+				return;
+			}
+			const candidates = queuedMemoryCandidates(activePack);
+			if (candidates.length === 0) {
+				ctx.ui.notify(`No queued memory candidates for ${activePack}.\nQueue path: ${saveQueuePath()}`, "info");
+				return;
+			}
+			ctx.ui.notify([
+				`${candidates.length} memory candidate${candidates.length === 1 ? "" : "s"} pending for ${activePack}`,
+				"",
+				...candidates.map((candidate, index) => formatQueuedMemoryCandidate(candidate, index + 1, true)),
+				"",
+				"Use /memctx-review approve <index> to save, /memctx-review reject <index> to discard, or /memctx-review clear to discard all for this workspace.",
+			].join("\n"), "info");
 		},
 	});
 
@@ -4907,7 +5057,7 @@ export default function (pi: ExtensionAPI) {
 				`Learning: ${autosaveMode}`,
 				`Search/retrieval: ${retrievalPolicy}`,
 				`Workspace map: ${packsDir ? workspaceMapPathForPacksDir(packsDir) : "<none>"}`,
-				`Save queue: ${readSaveQueue().length} pending`,
+				`Save queue: ${queuedMemoryCandidates(activePack).length} pending${queuedMemoryCandidates(activePack).length > 0 ? " — run /memctx-review" : ""}`,
 				`Template placeholders: ${placeholders}`,
 				`Possible duplicate slugs: ${duplicateSlugs.size}`,
 				`Secret scan warnings: ${possibleSecrets}`,
@@ -5195,7 +5345,7 @@ export default function (pi: ExtensionAPI) {
 		if (queuedCount > 0 && ctx.hasUI) {
 			ctx.ui.setWidget("memctx-learn", [
 				`\x1b[33m💡 memctx: ${queuedCount} memory candidate${queuedCount === 1 ? "" : "s"} queued for review.\x1b[0m`,
-				"   Review later if needed.",
+				"   Run /memctx-review to review, save, or discard queued candidates.",
 			]);
 			setTimeout(() => ctx.hasUI && ctx.ui.setWidget("memctx-learn", []), 30000);
 		}

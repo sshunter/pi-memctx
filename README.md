@@ -291,10 +291,31 @@ Most users only need the daily commands:
 | `/memctx` | Show compact help and current memory status. |
 | `/memctx-init` | Create/update memory for this workspace. If a model is selected, deep LLM enrichment starts in the background by default; use `--no-deep` to skip it. |
 | `/memctx-status` | Show workspace memory status; add `--advanced` for internal paths/config. |
+| `/memctx-review` | Review queued memory candidates; approve, reject, clear, or inspect the queue path. |
 | `/memctx-refresh` | Refresh workspace memory inventory/enrichment in the background. |
 | `/memctx-doctor` | Diagnose qmd, workspace memory, and configuration. |
 
 Older pack/config commands were removed from the public command surface to keep the extension simple. Advanced behavior is still configurable through environment variables and the local config file.
+
+### Reviewing queued memory candidates
+
+When automatic learning is unsure whether a candidate should be persisted, pi-memctx queues it for review instead of silently saving it. Review the active workspace queue with:
+
+```txt
+/memctx-review
+```
+
+Useful forms:
+
+```txt
+/memctx-review --list
+/memctx-review approve 1
+/memctx-review reject 1
+/memctx-review clear
+/memctx-review path
+```
+
+By default, review commands operate only on the active workspace memory pack. Advanced users can inspect the raw queue at `~/.cache/pi-memctx/save-queue.json`.
 
 ## Tools
 

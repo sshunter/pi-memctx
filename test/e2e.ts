@@ -111,6 +111,7 @@ async function main() {
 	assert(!!commands["memctx"], "/memctx command registered");
 	assert(!!commands["memctx-init"], "/memctx-init command registered");
 	assert(!!commands["memctx-status"], "/memctx-status command registered");
+	assert(!!commands["memctx-review"], "/memctx-review command registered");
 	assert(!!commands["memctx-refresh"], "/memctx-refresh command registered");
 	assert(!!commands["memctx-doctor"], "/memctx-doctor command registered");
 	assert(!commands["memctx-pack"], "/memctx-pack command removed from public surface");
