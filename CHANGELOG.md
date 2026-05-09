@@ -6,9 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+
+## [0.13.1] - 2026-05-09
+
 ### Added
 
 - Add `/memctx-review` to list, approve, reject, clear, and locate queued memory candidates for the active workspace memory.
+<!-- Automatically released from fix/memctx-review-queue as a patch bump via #69. -->
 
 ## [0.13.0] - 2026-05-04
 
