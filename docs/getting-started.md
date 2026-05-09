@@ -96,6 +96,14 @@ Ask the agent to save durable memory:
 Save this as a decision: we use deterministic e2e packs for integration tests.
 ```
 
+Review queued automatic-learning candidates:
+
+```txt
+/memctx-review
+/memctx-review approve 1
+/memctx-review reject 1
+```
+
 ## Advanced configuration
 
 Most users should keep defaults. Advanced behavior can be controlled with environment variables or `~/.config/pi-memctx/config.json`:

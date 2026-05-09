@@ -28,6 +28,26 @@ memctx: learned 5 memories:
 
 Learned notes are cross-linked with `[[wikilinks]]` to improve navigation and future retrieval.
 
+## Reviewing queued candidates
+
+When automatic learning is not confident enough to save directly, pi-memctx queues memory candidates for review. Run:
+
+```txt
+/memctx-review
+```
+
+Common actions:
+
+```txt
+/memctx-review --list       # show queued candidates for the active workspace memory
+/memctx-review approve 1    # save candidate 1 into the active Markdown pack
+/memctx-review reject 1     # discard candidate 1 without saving
+/memctx-review clear        # discard all queued candidates for the active workspace memory
+/memctx-review path         # show the raw queue path
+```
+
+The raw queue lives at `~/.cache/pi-memctx/save-queue.json`, but approving through `/memctx-review` is preferred because it reuses the same normalization, secret blocking, and Markdown-writing path as `memctx_save`.
+
 ## Explicit saves
 
 The `memctx_save` tool remains available to the agent when you explicitly ask it to remember something:

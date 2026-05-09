@@ -51,11 +51,13 @@ let tmpDir: string;
 function setupTmpDir() {
 	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "amv-test-"));
 	process.env.MEMCTX_CONFIG_PATH = path.join(tmpDir, "config.json");
+	process.env.MEMCTX_SAVE_QUEUE_PATH = path.join(tmpDir, "save-queue.json");
 }
 
 function cleanupTmpDir() {
 	_resetState();
 	delete process.env.MEMCTX_CONFIG_PATH;
+	delete process.env.MEMCTX_SAVE_QUEUE_PATH;
 	fs.rmSync(tmpDir, { recursive: true, force: true });
 }
 
@@ -270,6 +272,31 @@ function createMockCtx(sessionId = "abcdef1234567890") {
 			confirm: mock(async () => false),
 		},
 		cwd: tmpDir,
+	};
+}
+
+function writeSaveQueueForTest(candidates: any[]) {
+	const filePath = process.env.MEMCTX_SAVE_QUEUE_PATH!;
+	fs.mkdirSync(path.dirname(filePath), { recursive: true });
+	fs.writeFileSync(filePath, JSON.stringify(candidates, null, 2) + "\n");
+}
+
+function readSaveQueueForTest(): any[] {
+	return JSON.parse(fs.readFileSync(process.env.MEMCTX_SAVE_QUEUE_PATH!, "utf-8"));
+}
+
+function queuedCandidate(overrides: Record<string, unknown> = {}) {
+	return {
+		id: "mem-test-1",
+		type: "observation",
+		title: "Queued deploy pattern",
+		content: "Deployment uses a release checklist before production rollout.",
+		tags: ["autolearn", "deploy"],
+		confidence: 0.82,
+		reason: "Unit test candidate",
+		createdAt: "2026-05-09 12:00:00",
+		pack: "test-pack",
+		...overrides,
 	};
 }
 
@@ -901,7 +928,7 @@ describe("extension registration", () => {
 		const { pi, commands } = createMockPi();
 		registerExtension(pi as any);
 
-		for (const command of ["memctx", "memctx-init", "memctx-status", "memctx-refresh", "memctx-doctor"]) {
+		for (const command of ["memctx", "memctx-init", "memctx-status", "memctx-review", "memctx-refresh", "memctx-doctor"]) {
 			expect(commands[command]).toBeDefined();
 		}
 		for (const removed of ["memctx-pack", "pack", "memctx-pack-status", "pack-status", "memctx-strict", "memctx-pack-generate", "pack-generate", "memctx-retrieval", "memctx-autosave", "memctx-save-queue", "memctx-pack-enrich", "memctx-profile", "memctx-config"]) {
@@ -917,6 +944,98 @@ describe("extension registration", () => {
 		await commands["memctx-status"].handler("", ctx);
 		expect(ctx.ui.notify).toHaveBeenCalled();
 		expect((ctx.ui.notify.mock.calls.at(-1) as any)?.[0]).toContain("Workspace memory");
+	});
+
+	test("/memctx-review lists queued candidates for the active pack only", async () => {
+		const { packPath } = createTestVault();
+		writeSaveQueueForTest([
+			queuedCandidate(),
+			queuedCandidate({ id: "mem-other", title: "Other pack", pack: "other-pack" }),
+		]);
+		const { pi, commands } = createMockPi();
+		registerExtension(pi as any);
+		_setActivePack("test-pack", packPath);
+		const ctx = createMockCtx();
+
+		await commands["memctx-review"].handler("--list", ctx);
+		const message = (ctx.ui.notify.mock.calls.at(-1) as any)?.[0];
+		expect(message).toContain("1 memory candidate pending for test-pack");
+		expect(message).toContain("Queued deploy pattern");
+		expect(message).not.toContain("Other pack");
+	});
+
+	test("/memctx-review approve saves candidate and removes it from the queue", async () => {
+		const { packPath } = createTestVault();
+		writeSaveQueueForTest([queuedCandidate()]);
+		const { pi, commands } = createMockPi();
+		registerExtension(pi as any);
+		_setActivePack("test-pack", packPath);
+		const ctx = createMockCtx();
+
+		await commands["memctx-review"].handler("approve 1", ctx);
+
+		const savedPath = path.join(packPath, "60-observations", "queued-deploy-pattern.md");
+		expect(fs.existsSync(savedPath)).toBe(true);
+		expect(readSaveQueueForTest()).toHaveLength(0);
+		expect((ctx.ui.notify.mock.calls.at(-1) as any)?.[0]).toContain("Saved queued memory candidate");
+	});
+
+	test("/memctx-review reject discards candidate without saving", async () => {
+		const { packPath } = createTestVault();
+		writeSaveQueueForTest([queuedCandidate()]);
+		const { pi, commands } = createMockPi();
+		registerExtension(pi as any);
+		_setActivePack("test-pack", packPath);
+		const ctx = createMockCtx();
+
+		await commands["memctx-review"].handler("reject 1", ctx);
+
+		expect(fs.existsSync(path.join(packPath, "60-observations", "queued-deploy-pattern.md"))).toBe(false);
+		expect(readSaveQueueForTest()).toHaveLength(0);
+		expect((ctx.ui.notify.mock.calls.at(-1) as any)?.[0]).toContain("Discarded queued memory candidate");
+	});
+
+	test("/memctx-review clear removes only active-pack candidates after confirmation", async () => {
+		const { packPath } = createTestVault();
+		writeSaveQueueForTest([
+			queuedCandidate(),
+			queuedCandidate({ id: "mem-other", pack: "other-pack" }),
+		]);
+		const { pi, commands } = createMockPi();
+		registerExtension(pi as any);
+		_setActivePack("test-pack", packPath);
+		const ctx = createMockCtx();
+		ctx.ui.confirm = mock(async () => true);
+
+		await commands["memctx-review"].handler("clear", ctx);
+
+		const queue = readSaveQueueForTest();
+		expect(queue).toHaveLength(1);
+		expect(queue[0].pack).toBe("other-pack");
+		expect((ctx.ui.notify.mock.calls.at(-1) as any)?.[0]).toContain("Discarded 1 queued memory candidate");
+	});
+
+	test("/memctx-review keeps secret-looking candidates queued when approval is blocked", async () => {
+		const { packPath } = createTestVault();
+		writeSaveQueueForTest([queuedCandidate({ content: "password: super-secret" })]);
+		const { pi, commands } = createMockPi();
+		registerExtension(pi as any);
+		_setActivePack("test-pack", packPath);
+		const ctx = createMockCtx();
+
+		await commands["memctx-review"].handler("approve 1", ctx);
+
+		expect(readSaveQueueForTest()).toHaveLength(1);
+		expect((ctx.ui.notify.mock.calls.at(-1) as any)?.[0]).toContain("Could not save queued candidate");
+	});
+
+	test("/memctx-review path exposes the queue file path", async () => {
+		const { pi, commands } = createMockPi();
+		registerExtension(pi as any);
+		const ctx = createMockCtx();
+
+		await commands["memctx-review"].handler("path", ctx);
+		expect((ctx.ui.notify.mock.calls.at(-1) as any)?.[0]).toContain(process.env.MEMCTX_SAVE_QUEUE_PATH!);
 	});
 });
 
