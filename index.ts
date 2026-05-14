@@ -885,15 +885,47 @@ export function grepSearchPack(packPath: string, query: string, limit = 5): { te
 	return { text: matches.join("\n\n"), matchCount: matches.length };
 }
 
+/**
+ * Resolve the LLM model to use for pi-memctx operations.
+ *
+ * Priority:
+ *   1. MEMCTX_LLM_MODEL env var (if set and found in registry)
+ *   2. ctx.model (pi's active model — existing behavior)
+ */
+export function resolveLlmModel(ctx: ExtensionContext): ExtensionContext["model"] {
+	const envModel = process.env.MEMCTX_LLM_MODEL?.trim();
+	if (envModel) {
+		// Try provider/model format first
+		const slashIdx = envModel.indexOf("/");
+		if (slashIdx > 0) {
+			const provider = envModel.slice(0, slashIdx);
+			const modelId = envModel.slice(slashIdx + 1);
+			if (provider && modelId) {
+				const resolved = ctx.modelRegistry.find(provider, modelId);
+				if (resolved) return resolved;
+			}
+		}
+		// Try searching all available models by id
+		const allModels = ctx.modelRegistry.getAll();
+		const found = allModels.find((m) => m.id === envModel);
+		if (found) return found;
+		// Not found — warn and fall back to ctx.model
+		console.warn(`[pi-memctx] MEMCTX_LLM_MODEL=${envModel} not found in registry, falling back to ctx.model`);
+	}
+	return ctx.model;
+}
+
 async function completeJsonWithLlm<T>(
 	ctx: ExtensionContext,
 	useCase: string,
 	systemPrompt: string,
 	payload: unknown,
 	force = false,
+	model?: ExtensionContext["model"],
 ): Promise<T | null> {
-	if ((!force && llmMode === "off") || !ctx.model) return null;
-	return completeJsonWithModel<T>(ctx, useCase, systemPrompt, payload);
+	const resolvedModel = model ?? resolveLlmModel(ctx);
+	if ((!force && llmMode === "off") || !resolvedModel) return null;
+	return completeJsonWithModel<T>(ctx, useCase, systemPrompt, payload, resolvedModel);
 }
 
 async function completeJsonWithModel<T>(
@@ -901,12 +933,14 @@ async function completeJsonWithModel<T>(
 	useCase: string,
 	systemPrompt: string,
 	payload: unknown,
+	model?: ExtensionContext["model"],
 ): Promise<T | null> {
-	if (!ctx.model) return null;
+	const resolvedModel = model ?? resolveLlmModel(ctx);
+	if (!resolvedModel) return null;
 	try {
-		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(resolvedModel);
 		if (!auth.ok || !auth.apiKey) {
-			llmStats.lastError = auth.ok ? `No API key for ${ctx.model.provider}` : auth.error;
+			llmStats.lastError = auth.ok ? `No API key for ${resolvedModel.provider}` : auth.error;
 			return null;
 		}
 		const complete = await loadPiAiComplete();
@@ -924,7 +958,7 @@ async function completeJsonWithModel<T>(
 			timestamp: Date.now(),
 		};
 		const response = await complete(
-			ctx.model,
+			resolvedModel,
 			{ systemPrompt, messages: [userMessage] },
 			{ apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal },
 		);
@@ -1491,7 +1525,8 @@ async function judgeGatewayMemory(prompt: string, candidates: GatewayCandidate[]
 	}));
 	const coverage = evaluateGatewayCoverage(buildPromptRequirements(prompt), candidates);
 	const finalize = <T extends GatewayJudgeDecision & { backend: GatewayDecisionStatus["backend"] }>(decision: T) => downgradeDecisionForCoverage(decision, coverage, prompt);
-	if (precisionRepoQuestion && ctx.model) {
+	const resolvedModel = resolveLlmModel(ctx);
+	if (precisionRepoQuestion && resolvedModel) {
 		const decision = await completeJsonWithModel<GatewayJudgeDecision>(ctx, "memory-gateway-precision", [
 			"You are a precision judge for a coding-agent memory gateway.",
 			"The user is asking for repo/component/deploy details. Decide if memory is precise enough to answer without inspecting source-of-truth files.",
@@ -1521,7 +1556,7 @@ async function judgeGatewayMemory(prompt: string, candidates: GatewayCandidate[]
 		if (fast.status === "insufficient" && (fast.confidence ?? 0) >= 0.85) return finalize({ ...fast, backend: "fast-path" });
 	}
 	const shouldTryLlm = gatewayJudgeMode === "main-llm" || gatewayJudgeMode === "auto";
-	if (shouldTryLlm && ctx.model) {
+	if (shouldTryLlm && resolvedModel) {
 		const decision = await completeJsonWithModel<GatewayJudgeDecision>(ctx, "memory-gateway-sufficiency", [
 			"You are a memory gateway sufficiency judge for a coding agent.",
 			"The user may write in any language. Judge semantically, not by keyword lists.",
@@ -2135,7 +2170,7 @@ async function buildRetrievalQueries(prompt: string, ctx: ExtensionContext, poli
 	if (!sanitized) return [];
 	const effective = policy === "auto" ? "balanced" : policy;
 	if (effective === "fast") return [sanitized];
-	if (llmMode === "off" || !ctx.model) return [sanitized];
+	if (llmMode === "off" || !resolveLlmModel(ctx)) return [sanitized];
 	const decision = await completeJsonWithLlm<QueryExpansion>(ctx, "retrieval-query-expansion", [
 		"Generate compact memory search queries for a coding-agent memory pack.",
 		"Return ONLY JSON: {\"queries\":[...]} with 2-5 short queries. Include exact project/repo terms from the prompt.",
@@ -2196,7 +2231,7 @@ async function retrieveForPrompt(prompt: string, ctx: ExtensionContext): Promise
 		}
 
 		const remainingBudget = Math.max(1, retrievalLatencyBudgetMs - (Date.now() - start));
-		const shouldExpand = count === 0 && (retrievalPolicy !== "auto" || (llmMode !== "off" && !!ctx.model));
+		const shouldExpand = count === 0 && (retrievalPolicy !== "auto" || (llmMode !== "off" && !!resolveLlmModel(ctx)));
 		if (shouldExpand && remainingBudget > 50) {
 			const expanded = await withTimeout(buildRetrievalQueries(prompt, ctx, retrievalPolicy), remainingBudget, [sanitized]);
 			timedOut = expanded.timedOut;
@@ -2942,6 +2977,7 @@ export function buildNote(
 	title: string,
 	content: string,
 	tags: string[] = [],
+	model?: string,
 ): string {
 	const today = new Date().toISOString().slice(0, 10);
 	const noteTitle = normalizeNoteTitle(noteType, title);
@@ -2954,16 +2990,21 @@ export function buildNote(
 		...tags,
 	];
 
+	const frontmatter = [
+		`type: ${noteType}`,
+		`id: ${id}`,
+		`title: ${noteTitle}`,
+		`status: active`,
+		`source_of_truth: false`,
+		`freshness: current`,
+		`last_reviewed: ${today}`,
+		...(model ? [`model: ${model}`] : []),
+		`tags:`,
+		...allTags.map((t) => `  - ${t}`),
+	].join("\n");
+
 	return `---
-type: ${noteType}
-id: ${id}
-title: ${noteTitle}
-status: active
-source_of_truth: false
-freshness: current
-last_reviewed: ${today}
-tags:
-${allTags.map((t) => `  - ${t}`).join("\n")}
+${frontmatter}
 ---
 
 # ${noteTitle}
@@ -3152,7 +3193,7 @@ function appendSameTurnLearnedLinks(items: Array<{ rel: string; title: string; t
 	}
 }
 
-function saveMemoryCandidate(candidate: MemoryCandidate): { rel: string; action: "created" | "updated" } {
+function saveMemoryCandidate(candidate: MemoryCandidate, model?: string): { rel: string; action: "created" | "updated" } {
 	if (!activePackPath || !activePack) throw new Error("No active memory pack");
 	candidate = { ...candidate, title: normalizeNoteTitle(candidate.type, candidate.title), content: sanitizeEvidence(candidate.content) };
 	if (sensitivePatternHit(candidate.title, candidate.content)) throw new Error("Candidate appears to contain secrets");
@@ -3167,7 +3208,7 @@ function saveMemoryCandidate(candidate: MemoryCandidate): { rel: string; action:
 		fs.writeFileSync(filePath, `${existing}\n\n---\n\n## Update (${nowTimestamp()})\n\n${body}\n`, "utf-8");
 		return { rel: path.relative(activePackPath, filePath), action: "updated" };
 	}
-	fs.writeFileSync(filePath, buildNote(activePack, candidate.type, candidate.title, body, candidate.tags), "utf-8");
+	fs.writeFileSync(filePath, buildNote(activePack, candidate.type, candidate.title, body, candidate.tags, model), "utf-8");
 	return { rel: path.relative(activePackPath, filePath), action: "created" };
 }
 
@@ -3253,7 +3294,7 @@ function normalizeCuratorCandidate(raw: MemoryCuratorCandidate): MemoryCandidate
 }
 
 async function curateMemoryCandidatesFromTurn(ctx: ExtensionContext, snippets: string[], richDiscovery: boolean): Promise<MemoryCandidate[]> {
-	if (!ctx.model || snippets.length === 0) return [];
+	if (!resolveLlmModel(ctx) || snippets.length === 0) return [];
 	const generated = await completeJsonWithLlm<MemoryCuratorResult>(ctx, "memory-curator", [
 		"You are the post-turn memory curator for a coding agent.",
 		"The user may write in any language. Judge semantically; do not rely on specific product, repo, or keyword names.",
@@ -3887,7 +3928,7 @@ function extractImportantSnippet(repoPath: string, rel: string, maxChars = 5000)
 
 async function selectImportantFilesWithLlm(repo: RepoEvidence, inventory: RepoFileInventoryItem[], ctx: ExtensionContext, forceLlm = false): Promise<string[]> {
 	const fallback = inventory.slice(0, 24).map((f) => f.path);
-	if ((!forceLlm && llmMode === "off") || !ctx.model || inventory.length === 0) return fallback;
+	if ((!forceLlm && llmMode === "off") || !resolveLlmModel(ctx) || inventory.length === 0) return fallback;
 	const decision = await completeJsonWithLlm<LlmFileSelection>(ctx, "pack-generate-select-files", [
 		"Select the most important files for understanding a repository.",
 		"Prioritize architecture, entrypoints, API surface, data model, integrations, config, deployment, tests.",
@@ -3901,7 +3942,7 @@ async function selectImportantFilesWithLlm(repo: RepoEvidence, inventory: RepoFi
 }
 
 async function synthesizeRepoWithLlm(repo: RepoEvidence, selectedFiles: string[], ctx: ExtensionContext, forceLlm = false): Promise<LlmRepoSynthesis | null> {
-	if ((!forceLlm && llmMode === "off") || !ctx.model) return null;
+	if ((!forceLlm && llmMode === "off") || !resolveLlmModel(ctx)) return null;
 	const snippets = selectedFiles.map((file) => ({ file, snippet: extractImportantSnippet(repo.path, file, 3500) })).filter((f) => f.snippet.trim());
 	if (snippets.length === 0) return null;
 	return completeJsonWithLlm<LlmRepoSynthesis>(ctx, "pack-generate-synthesize-repo", [
@@ -3938,7 +3979,7 @@ function asDomainRows(value: unknown): string {
 	return rows.length ? rows.join("\n") : "| unknown | Insufficient evidence. | - |";
 }
 
-export function llmArchitectureNote(packSlug: string, repo: RepoEvidence, synthesis: LlmRepoSynthesis, selectedFiles: string[], today: string): string {
+export function llmArchitectureNote(packSlug: string, repo: RepoEvidence, synthesis: LlmRepoSynthesis, selectedFiles: string[], today: string, model?: string): string {
 	const domains = asDomainRows(synthesis.domains);
 	const architecture = asStringArray(synthesis.architecture);
 	const entrypoints = asStringArray(synthesis.entrypoints);
@@ -3946,19 +3987,24 @@ export function llmArchitectureNote(packSlug: string, repo: RepoEvidence, synthe
 	const envVars = asStringArray(synthesis.envVars);
 	const risks = asStringArray(synthesis.risks);
 	const testing = asStringArray(synthesis.testing);
+	const frontmatter = [
+		`type: context-pack`,
+		`id: context.${packSlug}.${repo.slug}.llm-architecture`,
+		`title: ${repo.name} LLM Architecture`,
+		`status: active`,
+		`source_of_truth: false`,
+		`freshness: current`,
+		`last_reviewed: ${today}`,
+		...(model ? [`model: ${model}`] : []),
+		`tags:`,
+		`  - pack/${packSlug}`,
+		`  - agent-memory/context-pack`,
+		`  - repo/${repo.slug}`,
+		`  - llm-generated`,
+	].join("\n");
+
 	return `---
-type: context-pack
-id: context.${packSlug}.${repo.slug}.llm-architecture
-title: ${repo.name} LLM Architecture
-status: active
-source_of_truth: false
-freshness: current
-last_reviewed: ${today}
-tags:
-  - pack/${packSlug}
-  - agent-memory/context-pack
-  - repo/${repo.slug}
-  - llm-generated
+${frontmatter}
 ---
 
 # ${repo.name} LLM Architecture
@@ -4026,8 +4072,9 @@ async function enrichGeneratedPackWithLlm(scanDir: string, packSlug: string, pac
 		writeGeneratedFile(packPath, contextRel, repoContextNote(packSlug, repo, today, inventory, selected), filesCreated);
 		contextRows.push(`| [[packs/${packSlug}/20-context/${repo.slug}|${repo.name}]] | ${repo.type}; ${repo.description || "repository context"}. |`);
 		if (ctx.hasUI) ctx.ui.notify(`memctx enrich: repo ${repo.name}: wrote deterministic context (${inventory.length} files indexed).`, "info");
-		if ((!forceLlm && llmMode === "off") || !ctx.model) {
-			if (ctx.hasUI) ctx.ui.notify(`memctx enrich: repo ${repo.name}: LLM architecture skipped (${ctx.model ? `llm:${llmMode}` : "no model"}).`, "info");
+		const resolvedLlmModel = resolveLlmModel(ctx);
+		if ((!forceLlm && llmMode === "off") || !resolvedLlmModel) {
+			if (ctx.hasUI) ctx.ui.notify(`memctx enrich: repo ${repo.name}: LLM architecture skipped (${resolvedLlmModel ? `llm:${llmMode}` : "no model"}).`, "info");
 			continue;
 		}
 		if (ctx.hasUI) ctx.ui.notify(`memctx enrich: repo ${repo.name}: synthesizing architecture from ${selected.length} files...`, "info");
@@ -4037,7 +4084,7 @@ async function enrichGeneratedPackWithLlm(scanDir: string, packSlug: string, pac
 			continue;
 		}
 		const rel = `20-context/${repo.slug}-llm-architecture.md`;
-		writeGeneratedFile(packPath, rel, llmArchitectureNote(packSlug, repo, synthesis, selected, today), filesCreated);
+		writeGeneratedFile(packPath, rel, llmArchitectureNote(packSlug, repo, synthesis, selected, today, resolveLlmModel(ctx)?.id), filesCreated);
 		if (ctx.hasUI) ctx.ui.notify(`memctx enrich: repo ${repo.name}: wrote ${rel}.`, "info");
 		contextRows.push(`| [[packs/${packSlug}/20-context/${repo.slug}-llm-architecture|${repo.name} LLM Architecture]] | LLM-assisted architecture synthesized from selected source evidence. |`);
 	}
@@ -4737,7 +4784,7 @@ export default function (pi: ExtensionAPI) {
 		if (recentMessages.length === 0) return;
 
 		let summary = recentMessages.join("\n");
-		if (llmMode !== "off" && ctx.model) {
+		if (llmMode !== "off" && resolveLlmModel(ctx)) {
 			const digest = await completeJsonWithLlm<{ summary?: string; completedActions?: string[]; decisions?: string[]; openQuestions?: string[]; memoryCandidates?: string[] }>(ctx, "session-handoff-digest", [
 				"Create a compact structured session handoff from recent conversation messages.",
 				"Return ONLY JSON with summary, completedActions[], decisions[], openQuestions[], memoryCandidates[]. Do not include secrets.",
@@ -4825,7 +4872,7 @@ export default function (pi: ExtensionAPI) {
 		const pack = activePack;
 		const packPath = activePackPath;
 		const collection = qmdCollection;
-		const useLlm = !noDeep && !!ctx.model;
+		const useLlm = !noDeep && !!resolveLlmModel(ctx);
 		const started = Date.now();
 		packEnrichRunning = true;
 		ctx.ui.notify(`memctx: Refreshing workspace memory in background.\nWorkspace: ${scanDir}\nMemory: ${pack}\nDeep LLM: ${useLlm ? "on" : "off"}`, "info");
@@ -4947,7 +4994,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				try {
-					const saved = saveMemoryCandidate(resolved.candidate);
+					const saved = saveMemoryCandidate(resolved.candidate, resolveLlmModel(ctx)?.id);
 					removeQueuedMemoryCandidate(resolved.candidate.id, activePack);
 					if (qmdAvailable) qmdEmbed(qmdCollection, activePackPath).catch(() => {});
 					ctx.ui.notify([
@@ -5186,7 +5233,7 @@ export default function (pi: ExtensionAPI) {
 			content: Type.String({ description: "Markdown content of the note. Include context, rationale, commands, links." }),
 			tags: Type.Optional(Type.Array(Type.String(), { description: "Additional tags (e.g., 'go', 'ci-cd', 'aws')" })),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!activePackPath || !activePack) {
 				return {
 					content: [{ type: "text" as const, text: "No active memory pack. Load a pack first." }],
@@ -5228,7 +5275,7 @@ export default function (pi: ExtensionAPI) {
 				reason: "Manual memctx_save",
 				createdAt: nowTimestamp(),
 				pack: activePack,
-			});
+			}, resolveLlmModel(ctx)?.id);
 
 			if (qmdAvailable) {
 				qmdEmbed(qmdCollection, activePackPath).catch(() => {});
@@ -5256,13 +5303,15 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// --- agent_end: automatically curate durable learnings ---
+	// --- agent_end: automatically curate durable learnings (fire-and-forget) ---
 	pi.on("agent_end", async (event, ctx) => {
 		if (!activePackPath || !activePack || autosaveMode === "off") return;
 
-		const messages = (event as any).messages ?? [];
-		const { snippets, hasWrites, richDiscovery } = collectTurnSnippets(messages);
-		if (snippets.length === 0) return;
+		void (async () => {
+			try {
+				const messages = (event as any).messages ?? [];
+				const { snippets, hasWrites, richDiscovery } = collectTurnSnippets(messages);
+				if (snippets.length === 0) return;
 
 		let candidates = await curateMemoryCandidatesFromTurn(ctx, snippets, richDiscovery);
 		const structuralCandidates = richDiscoveryMemoryCandidates(snippets, richDiscovery);
@@ -5299,7 +5348,7 @@ export default function (pi: ExtensionAPI) {
 			if (autosaveMode === "auto") {
 				if (candidate.confidence >= 0.78) {
 					try {
-						const saved = saveMemoryCandidate(candidate);
+						const saved = saveMemoryCandidate(candidate, resolveLlmModel(ctx)?.id);
 						savedCount++;
 						savedItems.push({ rel: saved.rel, title: candidate.title, type: candidate.type, action: saved.action });
 					} catch {
@@ -5317,7 +5366,7 @@ export default function (pi: ExtensionAPI) {
 				const approved = await ctx.ui.confirm("Save memory candidate?", `${candidate.type}: ${candidate.title}\n\n${truncate(candidate.content, 500)}`);
 				if (approved) {
 					try {
-						const saved = saveMemoryCandidate(candidate);
+						const saved = saveMemoryCandidate(candidate, resolveLlmModel(ctx)?.id);
 						savedCount++;
 						savedItems.push({ rel: saved.rel, title: candidate.title, type: candidate.type, action: saved.action });
 						continue;
@@ -5342,12 +5391,16 @@ export default function (pi: ExtensionAPI) {
 			]);
 			setTimeout(() => ctx.hasUI && ctx.ui.setWidget("memctx-learned", []), 30000);
 		}
-		if (queuedCount > 0 && ctx.hasUI) {
-			ctx.ui.setWidget("memctx-learn", [
-				`\x1b[33m💡 memctx: ${queuedCount} memory candidate${queuedCount === 1 ? "" : "s"} queued for review.\x1b[0m`,
-				"   Run /memctx-review to review, save, or discard queued candidates.",
-			]);
-			setTimeout(() => ctx.hasUI && ctx.ui.setWidget("memctx-learn", []), 30000);
-		}
+			if (queuedCount > 0 && ctx.hasUI) {
+				ctx.ui.setWidget("memctx-learn", [
+					`\x1b[33m💡 memctx: ${queuedCount} memory candidate${queuedCount === 1 ? "" : "s"} queued for review.\x1b[0m`,
+					"   Run /memctx-review to review, save, or discard queued candidates.",
+				]);
+				setTimeout(() => ctx.hasUI && ctx.ui.setWidget("memctx-learn", []), 30000);
+			}
+			} catch (err) {
+				console.error("[pi-memctx] curate failed (async)", err);
+			}
+		})();
 	});
 }

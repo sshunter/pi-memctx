@@ -40,6 +40,7 @@ import {
 	slugify,
 	todayStr,
 	truncate,
+	resolveLlmModel,
 } from "../index.js";
 
 // ---------------------------------------------------------------------------
@@ -1763,5 +1764,227 @@ describe("integration: full flow", () => {
 		// The handoff file should match "session" and "handoff" terms
 		expect(searchAfter.content[0].text).toContain("session-handoff");
 		expect(searchAfter.details.matchCount).toBeGreaterThan(0);
+	});
+});
+
+// ==========================================================================
+// 17. resolveLlmModel
+// ==========================================================================
+
+describe("resolveLlmModel", () => {
+	const origEnv = process.env.MEMCTX_LLM_MODEL;
+
+	afterEach(() => {
+		if (origEnv === undefined) {
+			delete process.env.MEMCTX_LLM_MODEL;
+		} else {
+			process.env.MEMCTX_LLM_MODEL = origEnv;
+		}
+	});
+
+	test("returns ctx.model when MEMCTX_LLM_MODEL is unset", () => {
+		delete process.env.MEMCTX_LLM_MODEL;
+		const mockModel = { id: "opus", name: "Opus", provider: "anthropic" } as any;
+		const ctx = {
+			model: mockModel,
+			modelRegistry: { find: mock(() => null), getAll: mock(() => []) },
+		} as any;
+		const result = resolveLlmModel(ctx);
+		expect(result).toBe(mockModel);
+	});
+
+	test("returns registry model when MEMCTX_LLM_MODEL matches by id", () => {
+		const haikuModel = { id: "claude-haiku-4-5", name: "Haiku", provider: "anthropic" } as any;
+		process.env.MEMCTX_LLM_MODEL = "claude-haiku-4-5";
+		const ctx = {
+			model: { id: "opus", name: "Opus", provider: "anthropic" } as any,
+			modelRegistry: {
+				find: mock(() => null),
+				getAll: mock(() => [haikuModel]),
+			},
+		} as any;
+		const result = resolveLlmModel(ctx);
+		expect(result).toBe(haikuModel);
+	});
+
+	test("returns registry model when MEMCTX_LLM_MODEL uses provider/model format", () => {
+		const sonnetModel = { id: "claude-sonnet-4-6", name: "Sonnet", provider: "anthropic" } as any;
+		process.env.MEMCTX_LLM_MODEL = "anthropic/claude-sonnet-4-6";
+		const ctx = {
+			model: { id: "opus", name: "Opus", provider: "anthropic" } as any,
+			modelRegistry: {
+				find: mock(() => sonnetModel),
+				getAll: mock(() => [sonnetModel]),
+			},
+		} as any;
+		const result = resolveLlmModel(ctx);
+		expect(result).toBe(sonnetModel);
+		expect(ctx.modelRegistry.find).toHaveBeenCalledWith("anthropic", "claude-sonnet-4-6");
+	});
+
+	test("falls back to ctx.model with warning when MEMCTX_LLM_MODEL is not found", () => {
+		const consoleWarnSpy = mock(() => {});
+		const origWarn = console.warn;
+		console.warn = consoleWarnSpy;
+		try {
+			process.env.MEMCTX_LLM_MODEL = "nonexistent-model";
+			const fallbackModel = { id: "opus", name: "Opus", provider: "anthropic" } as any;
+			const ctx = {
+				model: fallbackModel,
+				modelRegistry: {
+					find: mock(() => null),
+					getAll: mock(() => []),
+				},
+			} as any;
+			const result = resolveLlmModel(ctx);
+			expect(result).toBe(fallbackModel);
+			expect(consoleWarnSpy).toHaveBeenCalled();
+			expect(consoleWarnSpy.mock.calls.length).toBeGreaterThan(0);
+			const calls = consoleWarnSpy.mock.calls as unknown[][];
+			const warnMsg = String(calls[0]?.[0] ?? "");
+			expect(warnMsg).toContain("nonexistent-model");
+			expect(warnMsg).toContain("falling back");
+		} finally {
+			console.warn = origWarn;
+		}
+	});
+
+	test("returns undefined when MEMCTX_LLM_MODEL is not found and no ctx.model", () => {
+		const origWarn = console.warn;
+		console.warn = mock(() => {});
+		try {
+			process.env.MEMCTX_LLM_MODEL = "nonexistent-model";
+			const ctx = {
+				model: undefined,
+				modelRegistry: {
+					find: mock(() => null),
+					getAll: mock(() => []),
+				},
+			} as any;
+			const result = resolveLlmModel(ctx);
+			expect(result).toBeUndefined();
+		} finally {
+			console.warn = origWarn;
+		}
+	});
+});
+
+// ==========================================================================
+// 18. buildNote model attribution
+// ==========================================================================
+
+describe("buildNote model attribution", () => {
+	test("includes model field in frontmatter when provided", () => {
+		const note = buildNote("test-pack", "observation", "Test Note", "Content.", ["tag1"], "claude-haiku-4-5");
+		expect(note).toContain("model: claude-haiku-4-5");
+		expect(note).toContain("type: observation");
+		expect(note).toContain("# Test Note");
+	});
+
+	test("omits model field when not provided", () => {
+		const note = buildNote("test-pack", "observation", "Test Note", "Content.", ["tag1"]);
+		expect(note).not.toContain("model:");
+	});
+});
+
+// ==========================================================================
+// 19. llmArchitectureNote model attribution
+// ==========================================================================
+
+describe("llmArchitectureNote model attribution", () => {
+	test("includes model field in frontmatter when provided", () => {
+		const repo = {
+			name: "test-repo",
+			slug: "test-repo",
+			path: "/tmp/test",
+			type: "node",
+			description: "A test repo",
+			status: "active",
+			files: [],
+			safeCommands: [],
+			readmeExcerpt: "",
+			scripts: {},
+			tree: [],
+		} as any;
+		const synthesis = {
+			summary: "Test summary",
+			domains: [],
+			architecture: ["Express backend"],
+			entrypoints: ["src/index.ts"],
+			integrations: [],
+			envVars: [],
+			risks: [],
+			testing: [],
+		} as any;
+		const note = llmArchitectureNote("test-pack", repo, synthesis, ["src/index.ts"], "2026-05-14", "claude-sonnet-4-6");
+		expect(note).toContain("model: claude-sonnet-4-6");
+		expect(note).toContain("type: context-pack");
+	});
+
+	test("omits model field when not provided", () => {
+		const repo = {
+			name: "test-repo",
+			slug: "test-repo",
+			path: "/tmp/test",
+			type: "node",
+			description: "A test repo",
+			status: "active",
+			files: [],
+			safeCommands: [],
+			readmeExcerpt: "",
+			scripts: {},
+			tree: [],
+		} as any;
+		const synthesis = {
+			summary: "Test summary",
+			domains: [],
+			architecture: ["Express backend"],
+			entrypoints: ["src/index.ts"],
+			integrations: [],
+			envVars: [],
+			risks: [],
+			testing: [],
+		} as any;
+		const note = llmArchitectureNote("test-pack", repo, synthesis, ["src/index.ts"], "2026-05-14");
+		expect(note).not.toContain("model:");
+	});
+});
+
+// ==========================================================================
+// 20. memctx_save model attribution in frontmatter
+// ==========================================================================
+
+describe("memctx_save model attribution", () => {
+	beforeEach(() => {
+		setupTmpDir();
+		_setQmdAvailable(false);
+	});
+	afterEach(cleanupTmpDir);
+
+	test("saved note includes model field when ctx has model", async () => {
+		const { packPath } = createTestVault();
+		const { pi, tools } = createMockPi();
+		registerExtension(pi as any);
+		_setActivePack("test-pack", packPath);
+
+		// Execute with a mock context that has model
+		const mockModel = { id: "test-model", name: "Test", provider: "test" } as any;
+		const result = await tools["memctx_save"].execute(
+			"c1",
+			{
+				type: "observation",
+				title: "Redis port",
+				content: "Redis runs on port 6379.",
+			},
+			null, () => {}, { model: mockModel, modelRegistry: { find: () => null, getAll: () => [mockModel] } },
+		);
+
+		expect(result.details.action).toBe("created");
+		const noteDir = path.join(packPath, "60-observations");
+		const files = fs.readdirSync(noteDir);
+		const noteFile = files.find((f) => f.includes("redis-port"));
+		expect(noteFile).toBeDefined();
+		const content = fs.readFileSync(path.join(noteDir, noteFile!), "utf-8");
+		expect(content).toContain("model: test-model");
 	});
 });
