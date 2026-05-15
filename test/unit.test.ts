@@ -1780,10 +1780,12 @@ describe("resolveLlmModel", () => {
 		} else {
 			process.env.MEMCTX_LLM_MODEL = origEnv;
 		}
+		_resetState();
 	});
 
 	test("returns ctx.model when MEMCTX_LLM_MODEL is unset", () => {
 		delete process.env.MEMCTX_LLM_MODEL;
+		_resetState();
 		const mockModel = { id: "opus", name: "Opus", provider: "anthropic" } as any;
 		const ctx = {
 			model: mockModel,
@@ -1796,6 +1798,7 @@ describe("resolveLlmModel", () => {
 	test("returns registry model when MEMCTX_LLM_MODEL matches by id", () => {
 		const haikuModel = { id: "claude-haiku-4-5", name: "Haiku", provider: "anthropic" } as any;
 		process.env.MEMCTX_LLM_MODEL = "claude-haiku-4-5";
+		_resetState();
 		const ctx = {
 			model: { id: "opus", name: "Opus", provider: "anthropic" } as any,
 			modelRegistry: {
@@ -1810,6 +1813,7 @@ describe("resolveLlmModel", () => {
 	test("returns registry model when MEMCTX_LLM_MODEL uses provider/model format", () => {
 		const sonnetModel = { id: "claude-sonnet-4-6", name: "Sonnet", provider: "anthropic" } as any;
 		process.env.MEMCTX_LLM_MODEL = "anthropic/claude-sonnet-4-6";
+		_resetState();
 		const ctx = {
 			model: { id: "opus", name: "Opus", provider: "anthropic" } as any,
 			modelRegistry: {
@@ -1828,6 +1832,7 @@ describe("resolveLlmModel", () => {
 		console.warn = consoleWarnSpy;
 		try {
 			process.env.MEMCTX_LLM_MODEL = "nonexistent-model";
+			_resetState();
 			const fallbackModel = { id: "opus", name: "Opus", provider: "anthropic" } as any;
 			const ctx = {
 				model: fallbackModel,
@@ -1854,6 +1859,7 @@ describe("resolveLlmModel", () => {
 		console.warn = mock(() => {});
 		try {
 			process.env.MEMCTX_LLM_MODEL = "nonexistent-model";
+			_resetState();
 			const ctx = {
 				model: undefined,
 				modelRegistry: {
@@ -1863,6 +1869,33 @@ describe("resolveLlmModel", () => {
 			} as any;
 			const result = resolveLlmModel(ctx);
 			expect(result).toBeUndefined();
+		} finally {
+			console.warn = origWarn;
+		}
+	});
+
+	test("falls back without throwing when modelRegistry is absent", () => {
+		process.env.MEMCTX_LLM_MODEL = "claude-haiku-4-5";
+		_resetState();
+		const mockModel = { id: "opus", name: "Opus", provider: "anthropic" } as any;
+		const result = resolveLlmModel({ model: mockModel } as any);
+		expect(result).toBe(mockModel);
+	});
+
+	test("warns only once per invalid configured model", () => {
+		const consoleWarnSpy = mock(() => {});
+		const origWarn = console.warn;
+		console.warn = consoleWarnSpy;
+		try {
+			process.env.MEMCTX_LLM_MODEL = "missing-model";
+			_resetState();
+			const ctx = {
+				model: { id: "opus", name: "Opus", provider: "anthropic" } as any,
+				modelRegistry: { find: mock(() => null), getAll: mock(() => []) },
+			} as any;
+			resolveLlmModel(ctx);
+			resolveLlmModel(ctx);
+			expect(consoleWarnSpy.mock.calls.length).toBe(1);
 		} finally {
 			console.warn = origWarn;
 		}
@@ -1986,5 +2019,27 @@ describe("memctx_save model attribution", () => {
 		expect(noteFile).toBeDefined();
 		const content = fs.readFileSync(path.join(noteDir, noteFile!), "utf-8");
 		expect(content).toContain("model: test-model");
+	});
+
+	test("memctx_save attributes host model even when MEMCTX_LLM_MODEL is configured", async () => {
+		process.env.MEMCTX_LLM_MODEL = "internal-haiku";
+		_resetState();
+		const { packPath } = createTestVault();
+		const { pi, tools } = createMockPi();
+		registerExtension(pi as any);
+		_setActivePack("test-pack", packPath);
+
+		const hostModel = { id: "host-opus", name: "Host Opus", provider: "anthropic" } as any;
+		const internalModel = { id: "internal-haiku", name: "Internal Haiku", provider: "anthropic" } as any;
+		const result = await tools["memctx_save"].execute(
+			"c1",
+			{ type: "observation", title: "Host attribution", content: "Manual saved memory." },
+			null, () => {}, { model: hostModel, modelRegistry: { find: () => null, getAll: () => [internalModel] } },
+		);
+
+		expect(result.details.action).toBe("created");
+		const content = fs.readFileSync(path.join(packPath, "60-observations", "host-attribution.md"), "utf-8");
+		expect(content).toContain("model: host-opus");
+		expect(content).not.toContain("model: internal-haiku");
 	});
 });
