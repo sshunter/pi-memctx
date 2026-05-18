@@ -133,6 +133,7 @@ type LlmStats = {
 	estimatedInputChars: number;
 	estimatedOutputChars: number;
 	lastError?: string;
+	curateErrors?: number;
 };
 
 export type QmdStatus = {
@@ -182,6 +183,7 @@ type MemoryCandidate = {
 	reason: string;
 	createdAt: string;
 	pack: string;
+	model?: string;
 };
 
 type MemoryCuratorCandidate = {
@@ -223,6 +225,7 @@ type MemctxConfig = {
 	contextMaxItems: number;
 	contextStripMetadata: boolean;
 	contextPipeline: ContextPipeline;
+	llmModel?: string;
 };
 
 let currentProfile: MemctxProfile = "gateway";
@@ -246,6 +249,8 @@ let autosaveMode: AutosaveMode = parseAutosaveMode(process.env.MEMCTX_AUTOSAVE);
 let retrievalLatencyBudgetMs = parsePositiveIntEnv(process.env.MEMCTX_RETRIEVAL_LATENCY_BUDGET_MS, 1000);
 let autosaveQueueLowConfidence = parseBooleanDefaultFalse(process.env.MEMCTX_AUTOSAVE_QUEUE_LOW_CONFIDENCE);
 let gatewayJudgeMode: GatewayJudgeMode = parseGatewayJudgeMode(process.env.MEMCTX_GATEWAY_JUDGE);
+let llmModelOverride = process.env.MEMCTX_LLM_MODEL?.trim() || "";
+let warnedLlmModelOverride = "";
 let lastPackSelection: PackMatch | null = null;
 let lastPackSwitch: PackSwitch | null = null;
 let llmStats: LlmStats = {
@@ -350,7 +355,7 @@ function memctxConfigPath(): string {
 
 function profileDefaults(profile: Exclude<MemctxProfile, "custom">): MemctxConfig {
 	const base: Record<Exclude<MemctxProfile, "custom">, MemctxConfig> = {
-		gateway: { profile: "gateway", strict: false, retrieval: "balanced", retrievalLatencyBudgetMs: 800, autosave: "auto", autosaveQueueLowConfidence: true, llm: "off", autoSwitch: "cwd", autoBootstrap: "ask", startupDoctor: "off", toolFailureHints: true, contextMode: "compact", contextTokenBudget: 650, contextMaxItems: 10, contextStripMetadata: true, contextPipeline: "gateway" },
+		gateway: { profile: "gateway", strict: false, retrieval: "balanced", retrievalLatencyBudgetMs: 800, autosave: "auto", autosaveQueueLowConfidence: true, llm: "off", autoSwitch: "cwd", autoBootstrap: "ask", startupDoctor: "off", toolFailureHints: true, contextMode: "compact", contextTokenBudget: 650, contextMaxItems: 10, contextStripMetadata: true, contextPipeline: "gateway", llmModel: undefined },
 	};
 	return { ...base[profile], baseProfile: profile };
 }
@@ -412,12 +417,13 @@ function applyMemctxConfig(config: MemctxConfig) {
 	contextMaxItems = envOrConfig(process.env.MEMCTX_CONTEXT_MAX_ITEMS, parsePositiveIntEnv(process.env.MEMCTX_CONTEXT_MAX_ITEMS, 6), config.contextMaxItems);
 	contextStripMetadata = envOrConfig(process.env.MEMCTX_CONTEXT_STRIP_METADATA, parseBooleanDefaultTrue(process.env.MEMCTX_CONTEXT_STRIP_METADATA), config.contextStripMetadata);
 	contextPipeline = envOrConfig(process.env.MEMCTX_CONTEXT_PIPELINE, parseContextPipeline(process.env.MEMCTX_CONTEXT_PIPELINE), config.contextPipeline);
+	llmModelOverride = envOrConfig(process.env.MEMCTX_LLM_MODEL, process.env.MEMCTX_LLM_MODEL?.trim() || "", config.llmModel?.trim() || "");
 	gatewayJudgeMode = envOrConfig(process.env.MEMCTX_GATEWAY_JUDGE, parseGatewayJudgeMode(process.env.MEMCTX_GATEWAY_JUDGE), "conservative");
 	llmStats.mode = llmMode;
 }
 
 function currentMemctxConfig(profile: MemctxProfile = currentProfile): MemctxConfig {
-	return { profile, baseProfile, strict: strictMode, retrieval: retrievalPolicy, retrievalLatencyBudgetMs, autosave: autosaveMode, autosaveQueueLowConfidence, llm: llmMode, autoSwitch: autoSwitchMode, autoBootstrap: autoBootstrapMode, startupDoctor: startupDoctorMode, toolFailureHints, contextMode, contextTokenBudget, contextMaxItems, contextStripMetadata, contextPipeline };
+	return { profile, baseProfile, strict: strictMode, retrieval: retrievalPolicy, retrievalLatencyBudgetMs, autosave: autosaveMode, autosaveQueueLowConfidence, llm: llmMode, autoSwitch: autoSwitchMode, autoBootstrap: autoBootstrapMode, startupDoctor: startupDoctorMode, toolFailureHints, contextMode, contextTokenBudget, contextMaxItems, contextStripMetadata, contextPipeline, llmModel: llmModelOverride || undefined };
 }
 
 function persistCurrentConfig(profile: MemctxProfile = currentProfile) {
@@ -885,15 +891,52 @@ export function grepSearchPack(packPath: string, query: string, limit = 5): { te
 	return { text: matches.join("\n\n"), matchCount: matches.length };
 }
 
+/**
+ * Resolve the LLM model to use for pi-memctx operations.
+ *
+ * Priority:
+ *   1. resolved llmModel config / MEMCTX_LLM_MODEL override (if set and found in registry)
+ *   2. ctx.model (pi's active model — existing behavior)
+ */
+export function resolveLlmModel(ctx: ExtensionContext): ExtensionContext["model"] {
+	const configuredModel = llmModelOverride.trim();
+	const registry = ctx.modelRegistry;
+	if (configuredModel && registry) {
+		// Try provider/model format first
+		const slashIdx = configuredModel.indexOf("/");
+		if (slashIdx > 0 && typeof registry.find === "function") {
+			const provider = configuredModel.slice(0, slashIdx);
+			const modelId = configuredModel.slice(slashIdx + 1);
+			if (provider && modelId) {
+				const resolved = registry.find(provider, modelId);
+				if (resolved) return resolved;
+			}
+		}
+		// Try searching all available models by id
+		const allModels = typeof registry.getAll === "function" ? registry.getAll() : [];
+		const found = allModels.find((m) => m.id === configuredModel);
+		if (found) return found;
+		// Not found — warn once per configured value and fall back to ctx.model
+		if (warnedLlmModelOverride !== configuredModel) {
+			warnedLlmModelOverride = configuredModel;
+			console.warn(`[pi-memctx] llmModel=${configuredModel} not found in registry, falling back to ctx.model`);
+		}
+	}
+	return ctx.model;
+}
+
 async function completeJsonWithLlm<T>(
 	ctx: ExtensionContext,
 	useCase: string,
 	systemPrompt: string,
 	payload: unknown,
 	force = false,
+	model?: ExtensionContext["model"],
+	signal?: AbortSignal,
 ): Promise<T | null> {
-	if ((!force && llmMode === "off") || !ctx.model) return null;
-	return completeJsonWithModel<T>(ctx, useCase, systemPrompt, payload);
+	const resolvedModel = model ?? resolveLlmModel(ctx);
+	if ((!force && llmMode === "off") || !resolvedModel) return null;
+	return completeJsonWithModel<T>(ctx, useCase, systemPrompt, payload, resolvedModel, signal);
 }
 
 async function completeJsonWithModel<T>(
@@ -901,12 +944,15 @@ async function completeJsonWithModel<T>(
 	useCase: string,
 	systemPrompt: string,
 	payload: unknown,
+	model?: ExtensionContext["model"],
+	signal?: AbortSignal,
 ): Promise<T | null> {
-	if (!ctx.model) return null;
+	const resolvedModel = model ?? resolveLlmModel(ctx);
+	if (!resolvedModel) return null;
 	try {
-		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(resolvedModel);
 		if (!auth.ok || !auth.apiKey) {
-			llmStats.lastError = auth.ok ? `No API key for ${ctx.model.provider}` : auth.error;
+			llmStats.lastError = auth.ok ? `No API key for ${resolvedModel.provider}` : auth.error;
 			return null;
 		}
 		const complete = await loadPiAiComplete();
@@ -924,9 +970,9 @@ async function completeJsonWithModel<T>(
 			timestamp: Date.now(),
 		};
 		const response = await complete(
-			ctx.model,
+			resolvedModel,
 			{ systemPrompt, messages: [userMessage] },
-			{ apiKey: auth.apiKey, headers: auth.headers, signal: ctx.signal },
+			{ apiKey: auth.apiKey, headers: auth.headers, signal: signal ?? ctx.signal },
 		);
 		const out = response.content
 			.filter((c): c is { type: "text"; text: string } => c.type === "text")
@@ -1491,7 +1537,8 @@ async function judgeGatewayMemory(prompt: string, candidates: GatewayCandidate[]
 	}));
 	const coverage = evaluateGatewayCoverage(buildPromptRequirements(prompt), candidates);
 	const finalize = <T extends GatewayJudgeDecision & { backend: GatewayDecisionStatus["backend"] }>(decision: T) => downgradeDecisionForCoverage(decision, coverage, prompt);
-	if (precisionRepoQuestion && ctx.model) {
+	const resolvedModel = resolveLlmModel(ctx);
+	if (precisionRepoQuestion && resolvedModel) {
 		const decision = await completeJsonWithModel<GatewayJudgeDecision>(ctx, "memory-gateway-precision", [
 			"You are a precision judge for a coding-agent memory gateway.",
 			"The user is asking for repo/component/deploy details. Decide if memory is precise enough to answer without inspecting source-of-truth files.",
@@ -1521,7 +1568,7 @@ async function judgeGatewayMemory(prompt: string, candidates: GatewayCandidate[]
 		if (fast.status === "insufficient" && (fast.confidence ?? 0) >= 0.85) return finalize({ ...fast, backend: "fast-path" });
 	}
 	const shouldTryLlm = gatewayJudgeMode === "main-llm" || gatewayJudgeMode === "auto";
-	if (shouldTryLlm && ctx.model) {
+	if (shouldTryLlm && resolvedModel) {
 		const decision = await completeJsonWithModel<GatewayJudgeDecision>(ctx, "memory-gateway-sufficiency", [
 			"You are a memory gateway sufficiency judge for a coding agent.",
 			"The user may write in any language. Judge semantically, not by keyword lists.",
@@ -2135,7 +2182,7 @@ async function buildRetrievalQueries(prompt: string, ctx: ExtensionContext, poli
 	if (!sanitized) return [];
 	const effective = policy === "auto" ? "balanced" : policy;
 	if (effective === "fast") return [sanitized];
-	if (llmMode === "off" || !ctx.model) return [sanitized];
+	if (llmMode === "off" || !resolveLlmModel(ctx)) return [sanitized];
 	const decision = await completeJsonWithLlm<QueryExpansion>(ctx, "retrieval-query-expansion", [
 		"Generate compact memory search queries for a coding-agent memory pack.",
 		"Return ONLY JSON: {\"queries\":[...]} with 2-5 short queries. Include exact project/repo terms from the prompt.",
@@ -2196,7 +2243,7 @@ async function retrieveForPrompt(prompt: string, ctx: ExtensionContext): Promise
 		}
 
 		const remainingBudget = Math.max(1, retrievalLatencyBudgetMs - (Date.now() - start));
-		const shouldExpand = count === 0 && (retrievalPolicy !== "auto" || (llmMode !== "off" && !!ctx.model));
+		const shouldExpand = count === 0 && (retrievalPolicy !== "auto" || (llmMode !== "off" && !!resolveLlmModel(ctx)));
 		if (shouldExpand && remainingBudget > 50) {
 			const expanded = await withTimeout(buildRetrievalQueries(prompt, ctx, retrievalPolicy), remainingBudget, [sanitized]);
 			timedOut = expanded.timedOut;
@@ -2942,6 +2989,7 @@ export function buildNote(
 	title: string,
 	content: string,
 	tags: string[] = [],
+	model?: string,
 ): string {
 	const today = new Date().toISOString().slice(0, 10);
 	const noteTitle = normalizeNoteTitle(noteType, title);
@@ -2954,16 +3002,21 @@ export function buildNote(
 		...tags,
 	];
 
+	const frontmatter = [
+		`type: ${noteType}`,
+		`id: ${id}`,
+		`title: ${noteTitle}`,
+		`status: active`,
+		`source_of_truth: false`,
+		`freshness: current`,
+		`last_reviewed: ${today}`,
+		...(model ? [`model: ${model}`] : []),
+		`tags:`,
+		...allTags.map((t) => `  - ${t}`),
+	].join("\n");
+
 	return `---
-type: ${noteType}
-id: ${id}
-title: ${noteTitle}
-status: active
-source_of_truth: false
-freshness: current
-last_reviewed: ${today}
-tags:
-${allTags.map((t) => `  - ${t}`).join("\n")}
+${frontmatter}
 ---
 
 # ${noteTitle}
@@ -3152,7 +3205,7 @@ function appendSameTurnLearnedLinks(items: Array<{ rel: string; title: string; t
 	}
 }
 
-function saveMemoryCandidate(candidate: MemoryCandidate): { rel: string; action: "created" | "updated" } {
+function saveMemoryCandidate(candidate: MemoryCandidate, model?: string): { rel: string; action: "created" | "updated" } {
 	if (!activePackPath || !activePack) throw new Error("No active memory pack");
 	candidate = { ...candidate, title: normalizeNoteTitle(candidate.type, candidate.title), content: sanitizeEvidence(candidate.content) };
 	if (sensitivePatternHit(candidate.title, candidate.content)) throw new Error("Candidate appears to contain secrets");
@@ -3167,7 +3220,7 @@ function saveMemoryCandidate(candidate: MemoryCandidate): { rel: string; action:
 		fs.writeFileSync(filePath, `${existing}\n\n---\n\n## Update (${nowTimestamp()})\n\n${body}\n`, "utf-8");
 		return { rel: path.relative(activePackPath, filePath), action: "updated" };
 	}
-	fs.writeFileSync(filePath, buildNote(activePack, candidate.type, candidate.title, body, candidate.tags), "utf-8");
+	fs.writeFileSync(filePath, buildNote(activePack, candidate.type, candidate.title, body, candidate.tags, model ?? candidate.model), "utf-8");
 	return { rel: path.relative(activePackPath, filePath), action: "created" };
 }
 
@@ -3235,7 +3288,7 @@ function collectTurnSnippets(messages: unknown[]): { snippets: string[]; hasTool
 	return { snippets: snippets.slice(-30), hasToolCalls, hasWrites, richDiscovery };
 }
 
-function normalizeCuratorCandidate(raw: MemoryCuratorCandidate): MemoryCandidate | null {
+function normalizeCuratorCandidate(raw: MemoryCuratorCandidate, pack = activePack, model?: string): MemoryCandidate | null {
 	if (!raw?.shouldSave || !raw.title || !raw.content || !NOTE_TYPES.includes(raw.type as NoteType)) return null;
 	const content = sanitizeEvidence(raw.content);
 	if (sensitivePatternHit(raw.title, content)) return null;
@@ -3248,12 +3301,13 @@ function normalizeCuratorCandidate(raw: MemoryCuratorCandidate): MemoryCandidate
 		confidence: typeof raw.confidence === "number" ? Math.max(0, Math.min(1, raw.confidence)) : 0.7,
 		reason: raw.reason ?? "Memory curator candidate",
 		createdAt: nowTimestamp(),
-		pack: activePack,
+		pack,
+		model,
 	};
 }
 
-async function curateMemoryCandidatesFromTurn(ctx: ExtensionContext, snippets: string[], richDiscovery: boolean): Promise<MemoryCandidate[]> {
-	if (!ctx.model || snippets.length === 0) return [];
+async function curateMemoryCandidatesFromTurn(ctx: ExtensionContext, snippets: string[], richDiscovery: boolean, pack = activePack, model = resolveLlmModel(ctx), signal?: AbortSignal): Promise<MemoryCandidate[]> {
+	if (!model || snippets.length === 0) return [];
 	const generated = await completeJsonWithLlm<MemoryCuratorResult>(ctx, "memory-curator", [
 		"You are the post-turn memory curator for a coding agent.",
 		"The user may write in any language. Judge semantically; do not rely on specific product, repo, or keyword names.",
@@ -3272,7 +3326,7 @@ async function curateMemoryCandidatesFromTurn(ctx: ExtensionContext, snippets: s
 		"Keep each note concise but independently useful. Include source paths when available. Do not copy secret values.",
 		"Return ONLY JSON with either candidates[] or category arrays: contextUpdates[], observations[], runbooks[], decisions[], actions[], sessions[]. Each item: {shouldSave,type,title,content,tags[],confidence,reason}.",
 		"For simple turns return at most 3 total items. For rich discovery return up to 10 total items: at most 2 context, 3 observations, 3 runbooks, 1 decision, 1 action, 1 session.",
-	].join("\n"), { activePack, richDiscovery, snippets: snippets.slice(-24) }, true);
+	].join("\n"), { activePack: pack, richDiscovery, snippets: snippets.slice(-24) }, true, model, signal);
 	const raw = [
 		...(generated?.candidates ?? []),
 		...(generated?.contextUpdates ?? []).map((item) => ({ ...item, type: item.type ?? "context" as NoteType })),
@@ -3285,7 +3339,7 @@ async function curateMemoryCandidatesFromTurn(ctx: ExtensionContext, snippets: s
 	const seen = new Set<string>();
 	const candidates: MemoryCandidate[] = [];
 	for (const item of raw) {
-		const candidate = normalizeCuratorCandidate(item);
+		const candidate = normalizeCuratorCandidate(item, pack, model.id);
 		if (!candidate) continue;
 		const key = `${candidate.type}:${slugify(candidate.title)}`;
 		if (seen.has(key)) continue;
@@ -3887,7 +3941,7 @@ function extractImportantSnippet(repoPath: string, rel: string, maxChars = 5000)
 
 async function selectImportantFilesWithLlm(repo: RepoEvidence, inventory: RepoFileInventoryItem[], ctx: ExtensionContext, forceLlm = false): Promise<string[]> {
 	const fallback = inventory.slice(0, 24).map((f) => f.path);
-	if ((!forceLlm && llmMode === "off") || !ctx.model || inventory.length === 0) return fallback;
+	if ((!forceLlm && llmMode === "off") || !resolveLlmModel(ctx) || inventory.length === 0) return fallback;
 	const decision = await completeJsonWithLlm<LlmFileSelection>(ctx, "pack-generate-select-files", [
 		"Select the most important files for understanding a repository.",
 		"Prioritize architecture, entrypoints, API surface, data model, integrations, config, deployment, tests.",
@@ -3901,7 +3955,7 @@ async function selectImportantFilesWithLlm(repo: RepoEvidence, inventory: RepoFi
 }
 
 async function synthesizeRepoWithLlm(repo: RepoEvidence, selectedFiles: string[], ctx: ExtensionContext, forceLlm = false): Promise<LlmRepoSynthesis | null> {
-	if ((!forceLlm && llmMode === "off") || !ctx.model) return null;
+	if ((!forceLlm && llmMode === "off") || !resolveLlmModel(ctx)) return null;
 	const snippets = selectedFiles.map((file) => ({ file, snippet: extractImportantSnippet(repo.path, file, 3500) })).filter((f) => f.snippet.trim());
 	if (snippets.length === 0) return null;
 	return completeJsonWithLlm<LlmRepoSynthesis>(ctx, "pack-generate-synthesize-repo", [
@@ -3938,7 +3992,7 @@ function asDomainRows(value: unknown): string {
 	return rows.length ? rows.join("\n") : "| unknown | Insufficient evidence. | - |";
 }
 
-export function llmArchitectureNote(packSlug: string, repo: RepoEvidence, synthesis: LlmRepoSynthesis, selectedFiles: string[], today: string): string {
+export function llmArchitectureNote(packSlug: string, repo: RepoEvidence, synthesis: LlmRepoSynthesis, selectedFiles: string[], today: string, model?: string): string {
 	const domains = asDomainRows(synthesis.domains);
 	const architecture = asStringArray(synthesis.architecture);
 	const entrypoints = asStringArray(synthesis.entrypoints);
@@ -3946,19 +4000,24 @@ export function llmArchitectureNote(packSlug: string, repo: RepoEvidence, synthe
 	const envVars = asStringArray(synthesis.envVars);
 	const risks = asStringArray(synthesis.risks);
 	const testing = asStringArray(synthesis.testing);
+	const frontmatter = [
+		`type: context-pack`,
+		`id: context.${packSlug}.${repo.slug}.llm-architecture`,
+		`title: ${repo.name} LLM Architecture`,
+		`status: active`,
+		`source_of_truth: false`,
+		`freshness: current`,
+		`last_reviewed: ${today}`,
+		...(model ? [`model: ${model}`] : []),
+		`tags:`,
+		`  - pack/${packSlug}`,
+		`  - agent-memory/context-pack`,
+		`  - repo/${repo.slug}`,
+		`  - llm-generated`,
+	].join("\n");
+
 	return `---
-type: context-pack
-id: context.${packSlug}.${repo.slug}.llm-architecture
-title: ${repo.name} LLM Architecture
-status: active
-source_of_truth: false
-freshness: current
-last_reviewed: ${today}
-tags:
-  - pack/${packSlug}
-  - agent-memory/context-pack
-  - repo/${repo.slug}
-  - llm-generated
+${frontmatter}
 ---
 
 # ${repo.name} LLM Architecture
@@ -4026,8 +4085,9 @@ async function enrichGeneratedPackWithLlm(scanDir: string, packSlug: string, pac
 		writeGeneratedFile(packPath, contextRel, repoContextNote(packSlug, repo, today, inventory, selected), filesCreated);
 		contextRows.push(`| [[packs/${packSlug}/20-context/${repo.slug}|${repo.name}]] | ${repo.type}; ${repo.description || "repository context"}. |`);
 		if (ctx.hasUI) ctx.ui.notify(`memctx enrich: repo ${repo.name}: wrote deterministic context (${inventory.length} files indexed).`, "info");
-		if ((!forceLlm && llmMode === "off") || !ctx.model) {
-			if (ctx.hasUI) ctx.ui.notify(`memctx enrich: repo ${repo.name}: LLM architecture skipped (${ctx.model ? `llm:${llmMode}` : "no model"}).`, "info");
+		const resolvedLlmModel = resolveLlmModel(ctx);
+		if ((!forceLlm && llmMode === "off") || !resolvedLlmModel) {
+			if (ctx.hasUI) ctx.ui.notify(`memctx enrich: repo ${repo.name}: LLM architecture skipped (${resolvedLlmModel ? `llm:${llmMode}` : "no model"}).`, "info");
 			continue;
 		}
 		if (ctx.hasUI) ctx.ui.notify(`memctx enrich: repo ${repo.name}: synthesizing architecture from ${selected.length} files...`, "info");
@@ -4037,7 +4097,7 @@ async function enrichGeneratedPackWithLlm(scanDir: string, packSlug: string, pac
 			continue;
 		}
 		const rel = `20-context/${repo.slug}-llm-architecture.md`;
-		writeGeneratedFile(packPath, rel, llmArchitectureNote(packSlug, repo, synthesis, selected, today), filesCreated);
+		writeGeneratedFile(packPath, rel, llmArchitectureNote(packSlug, repo, synthesis, selected, today, resolvedLlmModel.id), filesCreated);
 		if (ctx.hasUI) ctx.ui.notify(`memctx enrich: repo ${repo.name}: wrote ${rel}.`, "info");
 		contextRows.push(`| [[packs/${packSlug}/20-context/${repo.slug}-llm-architecture|${repo.name} LLM Architecture]] | LLM-assisted architecture synthesized from selected source evidence. |`);
 	}
@@ -4737,7 +4797,7 @@ export default function (pi: ExtensionAPI) {
 		if (recentMessages.length === 0) return;
 
 		let summary = recentMessages.join("\n");
-		if (llmMode !== "off" && ctx.model) {
+		if (llmMode !== "off" && resolveLlmModel(ctx)) {
 			const digest = await completeJsonWithLlm<{ summary?: string; completedActions?: string[]; decisions?: string[]; openQuestions?: string[]; memoryCandidates?: string[] }>(ctx, "session-handoff-digest", [
 				"Create a compact structured session handoff from recent conversation messages.",
 				"Return ONLY JSON with summary, completedActions[], decisions[], openQuestions[], memoryCandidates[]. Do not include secrets.",
@@ -4801,6 +4861,7 @@ export default function (pi: ExtensionAPI) {
 				`Gateway judge: ${gatewayJudgeMode}`,
 				`Context: ${contextPipeline}/${contextMode}, ~${contextTokenBudget} tokens, ${contextMaxItems} items`,
 				`Save queue: ${queuedMemoryCandidates(activePack).length} pending${queuedMemoryCandidates(activePack).length > 0 ? " — run /memctx-review" : ""}`,
+				`LLM: ${llmMode}${llmModelOverride ? ` (${llmModelOverride})` : ""}, calls ${llmStats.callsThisSession}, curate errors ${llmStats.curateErrors ?? 0}${llmStats.lastError ? `, last error: ${llmStats.lastError}` : ""}`,
 				`qmd bin: ${qmdStatus.bin ?? "<none>"}`,
 				`qmd version: ${qmdStatus.version ?? "<unknown>"}`,
 				`qmd error: ${qmdStatus.error ?? "<none>"}`,
@@ -4825,7 +4886,7 @@ export default function (pi: ExtensionAPI) {
 		const pack = activePack;
 		const packPath = activePackPath;
 		const collection = qmdCollection;
-		const useLlm = !noDeep && !!ctx.model;
+		const useLlm = !noDeep && !!resolveLlmModel(ctx);
 		const started = Date.now();
 		packEnrichRunning = true;
 		ctx.ui.notify(`memctx: Refreshing workspace memory in background.\nWorkspace: ${scanDir}\nMemory: ${pack}\nDeep LLM: ${useLlm ? "on" : "off"}`, "info");
@@ -4947,7 +5008,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				try {
-					const saved = saveMemoryCandidate(resolved.candidate);
+					const saved = saveMemoryCandidate(resolved.candidate, resolved.candidate.model);
 					removeQueuedMemoryCandidate(resolved.candidate.id, activePack);
 					if (qmdAvailable) qmdEmbed(qmdCollection, activePackPath).catch(() => {});
 					ctx.ui.notify([
@@ -5186,7 +5247,7 @@ export default function (pi: ExtensionAPI) {
 			content: Type.String({ description: "Markdown content of the note. Include context, rationale, commands, links." }),
 			tags: Type.Optional(Type.Array(Type.String(), { description: "Additional tags (e.g., 'go', 'ci-cd', 'aws')" })),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!activePackPath || !activePack) {
 				return {
 					content: [{ type: "text" as const, text: "No active memory pack. Load a pack first." }],
@@ -5228,7 +5289,7 @@ export default function (pi: ExtensionAPI) {
 				reason: "Manual memctx_save",
 				createdAt: nowTimestamp(),
 				pack: activePack,
-			});
+			}, ctx.model?.id);
 
 			if (qmdAvailable) {
 				qmdEmbed(qmdCollection, activePackPath).catch(() => {});
@@ -5256,98 +5317,107 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	// --- agent_end: automatically curate durable learnings ---
+	// --- agent_end: automatically curate durable learnings (fire-and-forget) ---
 	pi.on("agent_end", async (event, ctx) => {
 		if (!activePackPath || !activePack || autosaveMode === "off") return;
+		// confirm requires an active turn/UI prompt; do not run it in a detached background task.
+		if (autosaveMode === "confirm") return;
 
-		const messages = (event as any).messages ?? [];
-		const { snippets, hasWrites, richDiscovery } = collectTurnSnippets(messages);
-		if (snippets.length === 0) return;
+		const packSnapshot = activePack;
+		const packPathSnapshot = activePackPath;
+		const qmdCollectionSnapshot = qmdCollection;
+		const qmdAvailableSnapshot = qmdAvailable;
+		const modelSnapshot = resolveLlmModel(ctx);
+		const abortController = new AbortController();
 
-		let candidates = await curateMemoryCandidatesFromTurn(ctx, snippets, richDiscovery);
-		const structuralCandidates = richDiscoveryMemoryCandidates(snippets, richDiscovery);
-		if (structuralCandidates.length > 0) {
-			const seen = new Set(candidates.map((candidate) => `${candidate.type}:${slugify(candidate.title)}`));
-			for (const candidate of structuralCandidates) {
-				const key = `${candidate.type}:${slugify(candidate.title)}`;
-				if (!seen.has(key)) {
-					candidates.push(candidate);
-					seen.add(key);
+		void (async () => {
+			try {
+				const messages = (event as any).messages ?? [];
+				const { snippets, hasWrites, richDiscovery } = collectTurnSnippets(messages);
+				if (snippets.length === 0) return;
+
+				let candidates = await curateMemoryCandidatesFromTurn(ctx, snippets, richDiscovery, packSnapshot, modelSnapshot, abortController.signal);
+				const structuralCandidates = richDiscoveryMemoryCandidates(snippets, richDiscovery).map((candidate) => ({ ...candidate, pack: packSnapshot, model: modelSnapshot?.id }));
+				if (structuralCandidates.length > 0) {
+					const seen = new Set(candidates.map((candidate) => `${candidate.type}:${slugify(candidate.title)}`));
+					for (const candidate of structuralCandidates) {
+						const key = `${candidate.type}:${slugify(candidate.title)}`;
+						if (!seen.has(key)) {
+							candidates.push(candidate);
+							seen.add(key);
+						}
+					}
 				}
-			}
-		}
-		if (candidates.length === 0) {
-			const fallback = deterministicMemoryCandidateFromTurn(snippets, hasWrites);
-			if (fallback) candidates = [fallback];
-		}
-		if (candidates.length === 0) return;
+				if (candidates.length === 0) {
+					const fallback = deterministicMemoryCandidateFromTurn(snippets, hasWrites);
+					if (fallback) candidates = [{ ...fallback, pack: packSnapshot, model: modelSnapshot?.id }];
+				}
+				if (candidates.length === 0) return;
 
-		candidates = enrichPersistenceCandidates(snippets, candidates);
-		const richSession = richPersistenceSessionCandidate(snippets, candidates);
-		if (richSession) {
-			const seen = new Set(candidates.map((candidate) => `${candidate.type}:${slugify(candidate.title)}`));
-			const key = `${richSession.type}:${slugify(richSession.title)}`;
-			if (!seen.has(key)) candidates.push(richSession);
-		}
+				candidates = enrichPersistenceCandidates(snippets, candidates).map((candidate) => ({ ...candidate, pack: packSnapshot, model: candidate.model ?? modelSnapshot?.id }));
+				const richSession = richPersistenceSessionCandidate(snippets, candidates);
+				if (richSession) {
+					const seen = new Set(candidates.map((candidate) => `${candidate.type}:${slugify(candidate.title)}`));
+					const key = `${richSession.type}:${slugify(richSession.title)}`;
+					if (!seen.has(key)) candidates.push({ ...richSession, pack: packSnapshot, model: modelSnapshot?.id });
+				}
 
-		const maxProcess = (richDiscovery || richSession) ? 12 : 3;
-		let savedCount = 0;
-		let queuedCount = 0;
-		const savedItems: Array<{ rel: string; title: string; type: NoteType; action: "created" | "updated" }> = [];
-		for (const candidate of candidates.slice(0, maxProcess)) {
-			if (sensitivePatternHit(candidate.title, candidate.content)) continue;
-			if (autosaveMode === "auto") {
-				if (candidate.confidence >= 0.78) {
+				const maxProcess = (richDiscovery || richSession) ? 12 : 3;
+				let savedCount = 0;
+				let queuedCount = 0;
+				const savedItems: Array<{ rel: string; title: string; type: NoteType; action: "created" | "updated" }> = [];
+				const runWithPackSnapshot = <T>(fn: () => T): T => {
+					const previousPack = activePack;
+					const previousPath = activePackPath;
 					try {
-						const saved = saveMemoryCandidate(candidate);
-						savedCount++;
-						savedItems.push({ rel: saved.rel, title: candidate.title, type: candidate.type, action: saved.action });
-					} catch {
+						activePack = packSnapshot;
+						activePackPath = packPathSnapshot;
+						return fn();
+					} finally {
+						activePack = previousPack;
+						activePackPath = previousPath;
+					}
+				};
+				for (const candidate of candidates.slice(0, maxProcess)) {
+					if (sensitivePatternHit(candidate.title, candidate.content)) continue;
+					if (autosaveMode === "auto" && candidate.confidence >= 0.78) {
+						try {
+							const saved = runWithPackSnapshot(() => saveMemoryCandidate(candidate, candidate.model));
+							savedCount++;
+							savedItems.push({ rel: saved.rel, title: candidate.title, type: candidate.type, action: saved.action });
+						} catch {
+							enqueueMemoryCandidate(candidate);
+							queuedCount++;
+						}
+					} else if (autosaveMode !== "auto" || autosaveQueueLowConfidence) {
 						enqueueMemoryCandidate(candidate);
 						queuedCount++;
 					}
-				} else if (autosaveQueueLowConfidence) {
-					enqueueMemoryCandidate(candidate);
-					queuedCount++;
 				}
-				continue;
-			}
 
-			if (autosaveMode === "confirm" && ctx.hasUI) {
-				const approved = await ctx.ui.confirm("Save memory candidate?", `${candidate.type}: ${candidate.title}\n\n${truncate(candidate.content, 500)}`);
-				if (approved) {
-					try {
-						const saved = saveMemoryCandidate(candidate);
-						savedCount++;
-						savedItems.push({ rel: saved.rel, title: candidate.title, type: candidate.type, action: saved.action });
-						continue;
-					} catch (err) {
-						ctx.ui.notify(`memctx: Could not save candidate: ${err instanceof Error ? err.message : String(err)}`, "error");
-					}
+				runWithPackSnapshot(() => appendSameTurnLearnedLinks(savedItems));
+				if ((savedCount > 0 || queuedCount > 0) && qmdAvailableSnapshot) qmdEmbed(qmdCollectionSnapshot, packPathSnapshot).catch(() => {});
+				if (savedItems.length > 0 && ctx.hasUI) {
+					const visibleSavedItems = uniqueSavedMemoryItems(savedItems);
+					const lines = runWithPackSnapshot(() => visibleSavedItems.map((item) => `   - ${item.type}: ${memoryWikilink(item.rel, item.title)} (${item.action})`));
+					ctx.ui.setWidget("memctx-learned", [
+						`\x1b[32m🧠 memctx learned ${visibleSavedItems.length} memor${visibleSavedItems.length === 1 ? "y" : "ies"}\x1b[0m`,
+						...lines,
+					]);
+					setTimeout(() => ctx.hasUI && ctx.ui.setWidget("memctx-learned", []), 30000);
 				}
+				if (queuedCount > 0 && ctx.hasUI) {
+					ctx.ui.setWidget("memctx-learn", [
+						`\x1b[33m💡 memctx: ${queuedCount} memory candidate${queuedCount === 1 ? "" : "s"} queued for review.\x1b[0m`,
+						"   Run /memctx-review to review, save, or discard queued candidates.",
+					]);
+					setTimeout(() => ctx.hasUI && ctx.ui.setWidget("memctx-learn", []), 30000);
+				}
+			} catch (err) {
+				llmStats.curateErrors = (llmStats.curateErrors ?? 0) + 1;
+				llmStats.lastError = err instanceof Error ? err.message : String(err);
+				(ctx as any).logger?.error?.("[pi-memctx] curate failed (async)", err);
 			}
-
-			enqueueMemoryCandidate(candidate);
-			queuedCount++;
-		}
-
-		appendSameTurnLearnedLinks(savedItems);
-		if ((savedCount > 0 || queuedCount > 0) && qmdAvailable) qmdEmbed(qmdCollection, activePackPath).catch(() => {});
-		if (savedItems.length > 0 && ctx.hasUI) {
-			const visibleSavedItems = uniqueSavedMemoryItems(savedItems);
-			const lines = visibleSavedItems.map((item) => `   - ${item.type}: ${memoryWikilink(item.rel, item.title)} (${item.action})`);
-			ctx.ui.setWidget("memctx-learned", [
-				`\x1b[32m🧠 memctx learned ${visibleSavedItems.length} memor${visibleSavedItems.length === 1 ? "y" : "ies"}\x1b[0m`,
-				...lines,
-			]);
-			setTimeout(() => ctx.hasUI && ctx.ui.setWidget("memctx-learned", []), 30000);
-		}
-		if (queuedCount > 0 && ctx.hasUI) {
-			ctx.ui.setWidget("memctx-learn", [
-				`\x1b[33m💡 memctx: ${queuedCount} memory candidate${queuedCount === 1 ? "" : "s"} queued for review.\x1b[0m`,
-				"   Run /memctx-review to review, save, or discard queued candidates.",
-			]);
-			setTimeout(() => ctx.hasUI && ctx.ui.setWidget("memctx-learn", []), 30000);
-		}
+		})();
 	});
 }

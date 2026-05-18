@@ -455,6 +455,7 @@ Common environment variables:
 | `MEMCTX_CONTEXT_MAX_ITEMS` | Maximum memory items to include. |
 | `MEMCTX_RETRIEVAL` | Retrieval policy: `fast`, `balanced`, `deep`, `strict`, `auto`. |
 | `MEMCTX_GATEWAY_JUDGE` | Gateway judge mode: `off`, `conservative`, `auto`, `main-llm`. |
+| `MEMCTX_LLM_MODEL` / `llmModel` | Optional internal LLM model override by `id` or `provider/id`; falls back to the host model if unavailable. |
 | `MEMCTX_AUTOSAVE` | Autosave mode: `off`, `suggest`, `confirm`, `auto`. |
 | `QMD_PATH` / `MEMCTX_QMD_BIN` | Explicit qmd binary path. |
 

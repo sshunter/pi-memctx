@@ -111,6 +111,7 @@ Most users should keep defaults. Advanced behavior can be controlled with enviro
 ```bash
 MEMCTX_AUTO_SWITCH=off|cwd|prompt|all
 MEMCTX_LLM_MODE=off|assist|first
+MEMCTX_LLM_MODEL=anthropic/claude-haiku-4-5  # optional internal LLM override; config.json key: llmModel
 MEMCTX_RETRIEVAL=auto|fast|balanced|deep|strict
 MEMCTX_RETRIEVAL_LATENCY_BUDGET_MS=1000
 MEMCTX_AUTOSAVE=off|suggest|confirm|auto
