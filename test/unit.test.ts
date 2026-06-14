@@ -16,8 +16,8 @@ import {
 	_setActivePack,
 	_setContextPipelineForTest,
 	_setQmdAvailable,
+	_setRequireWorkspaceMap,
 	_setStrictMode,
-	_setVaultRoot,
 	buildNote,
 	buildPackContext,
 	buildPromptRequirements,
@@ -425,9 +425,16 @@ describe("detectActivePack", () => {
 		expect(detectActivePack(packsDir)).toBeNull();
 	});
 
-	test("returns single pack", () => {
+	test("returns null for a single unmapped pack by default", () => {
 		const packsDir = path.join(tmpDir, "packs");
 		fs.mkdirSync(path.join(packsDir, "my-project"), { recursive: true });
+		expect(detectActivePack(packsDir)).toBeNull();
+	});
+
+	test("returns single pack when workspace mapping is not required", () => {
+		const packsDir = path.join(tmpDir, "packs");
+		fs.mkdirSync(path.join(packsDir, "my-project"), { recursive: true });
+		_setRequireWorkspaceMap(false);
 		expect(detectActivePack(packsDir)).toBe("my-project");
 	});
 
@@ -437,17 +444,26 @@ describe("detectActivePack", () => {
 		expect(detectActivePack(packsDir)).toBeNull();
 	});
 
-	test("prefers pack with 00-system dir when multiple packs exist", () => {
+	test("returns null when multiple unmapped packs exist", () => {
 		const packsDir = path.join(tmpDir, "packs");
 		fs.mkdirSync(path.join(packsDir, "alpha"), { recursive: true });
 		fs.mkdirSync(path.join(packsDir, "beta", "00-system"), { recursive: true });
+		expect(detectActivePack(packsDir)).toBeNull();
+	});
+
+	test("prefers pack with 00-system dir when workspace mapping is not required", () => {
+		const packsDir = path.join(tmpDir, "packs");
+		fs.mkdirSync(path.join(packsDir, "alpha"), { recursive: true });
+		fs.mkdirSync(path.join(packsDir, "beta", "00-system"), { recursive: true });
+		_setRequireWorkspaceMap(false);
 		expect(detectActivePack(packsDir)).toBe("beta");
 	});
 
-	test("returns first pack alphabetically when none have 00-system", () => {
+	test("returns first pack alphabetically when none have 00-system and mapping is not required", () => {
 		const packsDir = path.join(tmpDir, "packs");
 		fs.mkdirSync(path.join(packsDir, "zebra"), { recursive: true });
 		fs.mkdirSync(path.join(packsDir, "alpha"), { recursive: true });
+		_setRequireWorkspaceMap(false);
 		// Returns first in readdir order (implementation-dependent)
 		const result = detectActivePack(packsDir);
 		expect(result).not.toBeNull();
@@ -461,28 +477,65 @@ describe("detectActivePack", () => {
 		expect(detectActivePack(packsDir)).toBeNull();
 	});
 
-	test("auto-detects pack by cwd match", () => {
+	test("auto-detects pack by workspace map entry", () => {
 		const packsDir = path.join(tmpDir, "packs");
-		// Pack A references "project-alpha"
 		const packA = path.join(packsDir, "alpha", "20-context");
 		fs.mkdirSync(packA, { recursive: true });
 		fs.writeFileSync(path.join(packA, "context.md"), "This pack covers project-alpha platform.");
-		// Pack B references "project-beta"
 		const packB = path.join(packsDir, "payments", "20-context");
 		fs.mkdirSync(packB, { recursive: true });
 		fs.writeFileSync(path.join(packB, "context.md"), "This pack covers project-beta API services.");
 
-		// cwd is inside project-beta → should pick payments pack
+		// Seed workspace map
+		const systemDir = path.join(path.dirname(packsDir), "00-system");
+		fs.mkdirSync(systemDir, { recursive: true });
+		fs.writeFileSync(
+			path.join(systemDir, "workspace-map.json"),
+			JSON.stringify(
+				{
+					version: 1,
+					workspaces: [
+						{ path: "/code/project-beta/payment", pack: "payments", createdAt: "2026-01-01T00:00:00Z", lastUsedAt: "2026-01-01T00:00:00Z" },
+						{ path: "/code/project-alpha/apps/web", pack: "alpha", createdAt: "2026-01-01T00:00:00Z", lastUsedAt: "2026-01-01T00:00:00Z" },
+					],
+				},
+				null,
+				2,
+			),
+		);
+
 		expect(detectActivePack(packsDir, "/code/project-beta/payment")).toBe("payments");
-		// cwd is inside project-alpha → should pick alpha pack
 		expect(detectActivePack(packsDir, "/code/project-alpha/apps/web")).toBe("alpha");
 	});
 
-	test("falls back to manifest when cwd matches nothing", () => {
+	test("auto-detects pack by cwd content match only when workspace mapping is not required", () => {
+		const packsDir = path.join(tmpDir, "packs");
+		const packA = path.join(packsDir, "alpha", "20-context");
+		fs.mkdirSync(packA, { recursive: true });
+		fs.writeFileSync(path.join(packA, "context.md"), "This pack covers project-alpha platform.");
+		const packB = path.join(packsDir, "payments", "20-context");
+		fs.mkdirSync(packB, { recursive: true });
+		fs.writeFileSync(path.join(packB, "context.md"), "This pack covers project-beta API services.");
+
+		_setRequireWorkspaceMap(false);
+		expect(detectActivePack(packsDir, "/code/project-beta/payment")).toBe("payments");
+		expect(detectActivePack(packsDir, "/code/project-alpha/apps/web")).toBe("alpha");
+	});
+
+	test("returns null for unmapped cwd even when pack content matches", () => {
+		const packsDir = path.join(tmpDir, "packs");
+		const packA = path.join(packsDir, "alpha", "20-context");
+		fs.mkdirSync(packA, { recursive: true });
+		fs.writeFileSync(path.join(packA, "context.md"), "This pack covers project-alpha platform.");
+
+		expect(detectActivePack(packsDir, "/code/project-alpha/apps/web")).toBeNull();
+	});
+
+	test("returns null when cwd matches nothing", () => {
 		const packsDir = path.join(tmpDir, "packs");
 		fs.mkdirSync(path.join(packsDir, "alpha"), { recursive: true });
 		fs.mkdirSync(path.join(packsDir, "beta", "00-system"), { recursive: true });
-		expect(detectActivePack(packsDir, "/totally/unrelated/project")).toBe("beta");
+		expect(detectActivePack(packsDir, "/totally/unrelated/project")).toBeNull();
 	});
 });
 

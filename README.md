@@ -445,18 +445,39 @@ Memory is Markdown on disk. You can inspect every byte.
 
 ## Configuration
 
-Most users should start with the defaults. Advanced users can configure behavior with environment variables or the local config file at `~/.config/pi-memctx/config.json`.
+This fork is opt-in by default. A memory pack is only loaded for a workspace after you run `/memctx-init` for that workspace. The extension then records the mapping in a workspace map. Unmapped projects never load memory and never auto-save it.
 
-Common environment variables:
+### Workspace mapping
+
+`/memctx-init` creates a Markdown pack for the target directory and writes a `cwd -> pack` entry in the workspace map. On future sessions the extension checks that map first. If the current directory is not mapped, no pack is loaded and no memory is written.
+
+To disable strict workspace mapping and fall back to the old behavior (cwd-name guessing, single-pack fallback, etc.), set:
+
+```bash
+export MEMCTX_REQUIRE_WORKSPACE_MAP=false
+```
+
+Or in `~/.config/pi-memctx/config.json`:
+
+```json
+{
+  "requireWorkspaceMap": false
+}
+```
+
+### Common environment variables
 
 | Variable | Purpose |
 |---|---|
+| `MEMCTX_REQUIRE_WORKSPACE_MAP` | When `true` (default), only mapped workspaces load memory. |
+| `MEMCTX_AUTO_BOOTSTRAP` | Create memory for unknown projects: `off` (default), `ask`, or `on`. |
+| `MEMCTX_AUTO_SWITCH` | Switch packs from prompt or cwd mentions: `off`, `cwd` (default), `prompt`, `all`. |
+| `MEMCTX_AUTOSAVE` | Autosave mode for mapped projects: `off`, `suggest`, `confirm`, `auto` (default). |
 | `MEMCTX_CONTEXT_TOKEN_BUDGET` | Approximate injected context budget. |
 | `MEMCTX_CONTEXT_MAX_ITEMS` | Maximum memory items to include. |
 | `MEMCTX_RETRIEVAL` | Retrieval policy: `fast`, `balanced`, `deep`, `strict`, `auto`. |
 | `MEMCTX_GATEWAY_JUDGE` | Gateway judge mode: `off`, `conservative`, `auto`, `main-llm`. |
 | `MEMCTX_LLM_MODEL` / `llmModel` | Optional internal LLM model override by `id` or `provider/id`; falls back to the host model if unavailable. |
-| `MEMCTX_AUTOSAVE` | Autosave mode: `off`, `suggest`, `confirm`, `auto`. |
 | `QMD_PATH` / `MEMCTX_QMD_BIN` | Explicit qmd binary path. |
 
 ## Development

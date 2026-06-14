@@ -7,7 +7,17 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import registerExtension, { _resetState, _setActivePack, _setQmdAvailable, _setVaultRoot, buildPackContext, detectActivePack, findVaultRoot, scanPackFiles } from "../index.js";
+import registerExtension, {
+	_resetState,
+	_setActivePack,
+	_setQmdAvailable,
+	_setRequireWorkspaceMap,
+	_setVaultRoot,
+	buildPackContext,
+	detectActivePack,
+	findVaultRoot,
+	scanPackFiles,
+} from "../index.js";
 
 const TMP_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memctx-e2e-"));
 const PACKS_DIR = path.join(TMP_ROOT, "packs");
@@ -28,6 +38,22 @@ function createDemoPack() {
 	write("40-actions/2026-04-30-ci-setup.md", "# Action — CI setup\n\nGitHub Actions validates tests before release.\n");
 	write("50-decisions/0001-api-style.md", "# Decision — API style\n\nUse REST handlers with clear request validation and idempotent webhook processing. Authentication uses ORY Kratos.\n");
 	write("70-runbooks/deploy.md", "# Deploy Runbook\n\nDeploy production with `make deploy-prod` after tests pass. Roll back with `make rollback-prod`.\n");
+
+	// Simulate the workspace map entry that /memctx-init would create.
+	const systemDir = path.join(TMP_ROOT, "00-system");
+	fs.mkdirSync(systemDir, { recursive: true });
+	fs.writeFileSync(
+		path.join(systemDir, "workspace-map.json"),
+		JSON.stringify(
+			{
+				version: 1,
+				workspaces: [{ path: TMP_ROOT, pack: PACK_NAME, createdAt: new Date().toISOString(), lastUsedAt: new Date().toISOString() }],
+			},
+			null,
+			2,
+		),
+		"utf-8",
+	);
 }
 
 function createMockPi() {
@@ -77,7 +103,7 @@ async function main() {
 	const foundRoot = findVaultRoot(PACK_PATH);
 	assert(foundRoot === TMP_ROOT, "findVaultRoot finds generated package root", `got: ${foundRoot}`);
 
-	const foundPack = detectActivePack(PACKS_DIR);
+	const foundPack = detectActivePack(PACKS_DIR, TMP_ROOT);
 	assert(foundPack === PACK_NAME, `detectActivePack finds generated pack (got: ${foundPack})`);
 
 	const packFiles = scanPackFiles(PACK_PATH);

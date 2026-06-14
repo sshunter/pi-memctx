@@ -208,6 +208,7 @@ type MemctxConfig = {
 	llm: LlmMode;
 	autoSwitch: AutoSwitchMode;
 	autoBootstrap: AutoBootstrapMode;
+	requireWorkspaceMap: boolean;
 	startupDoctor: StartupDoctorMode;
 	toolFailureHints: boolean;
 	contextMode: ContextMode;
@@ -220,7 +221,7 @@ type MemctxConfig = {
 
 let currentProfile: MemctxProfile = "gateway";
 let baseProfile: Exclude<MemctxProfile, "custom"> = "gateway";
-let autoBootstrapMode: AutoBootstrapMode = "ask";
+let autoBootstrapMode: AutoBootstrapMode = "off";
 let startupDoctorMode: StartupDoctorMode = "light";
 let toolFailureHints = true;
 let contextMode: ContextMode = parseContextMode(process.env.MEMCTX_CONTEXT_MODE);
@@ -233,6 +234,7 @@ let lastRetrieval: RetrievalStatus | null = null;
 let lastGatewayDecision: GatewayDecisionStatus | null = null;
 let packEnrichRunning = false;
 let autoSwitchMode: AutoSwitchMode = parseAutoSwitchMode(process.env.MEMCTX_AUTO_SWITCH);
+let requireWorkspaceMap = parseRequireWorkspaceMap(process.env.MEMCTX_REQUIRE_WORKSPACE_MAP);
 let llmMode: LlmMode = parseLlmMode(process.env.MEMCTX_LLM_MODE);
 let retrievalPolicy: RetrievalPolicy = parseRetrievalPolicy(process.env.MEMCTX_RETRIEVAL);
 let autosaveMode: AutosaveMode = parseAutosaveMode(process.env.MEMCTX_AUTOSAVE);
@@ -329,8 +331,14 @@ function parseGatewayJudgeMode(value: string | undefined): GatewayJudgeMode {
 }
 
 function parseAutoBootstrapMode(value: string | undefined): AutoBootstrapMode {
-	const normalized = (value ?? "ask").toLowerCase();
-	return ["off", "ask", "on"].includes(normalized) ? (normalized as AutoBootstrapMode) : "ask";
+	const normalized = (value ?? "off").toLowerCase();
+	return ["off", "ask", "on"].includes(normalized) ? (normalized as AutoBootstrapMode) : "off";
+}
+
+function parseRequireWorkspaceMap(value: string | undefined): boolean {
+	const normalized = (value ?? "true").toLowerCase();
+	if (["0", "false", "no", "off"].includes(normalized)) return false;
+	return true;
 }
 
 function parseStartupDoctorMode(value: string | undefined): StartupDoctorMode {
@@ -354,7 +362,8 @@ function profileDefaults(profile: Exclude<MemctxProfile, "custom">): MemctxConfi
 			autosaveQueueLowConfidence: true,
 			llm: "off",
 			autoSwitch: "cwd",
-			autoBootstrap: "ask",
+			autoBootstrap: "off",
+			requireWorkspaceMap: true,
 			startupDoctor: "off",
 			toolFailureHints: true,
 			contextMode: "compact",
@@ -422,6 +431,7 @@ function applyMemctxConfig(config: MemctxConfig) {
 	llmMode = envOrConfig(process.env.MEMCTX_LLM_MODE, parseLlmMode(process.env.MEMCTX_LLM_MODE), config.llm);
 	autoSwitchMode = envOrConfig(process.env.MEMCTX_AUTO_SWITCH, parseAutoSwitchMode(process.env.MEMCTX_AUTO_SWITCH), config.autoSwitch);
 	autoBootstrapMode = envOrConfig(process.env.MEMCTX_AUTO_BOOTSTRAP, parseAutoBootstrapMode(process.env.MEMCTX_AUTO_BOOTSTRAP), config.autoBootstrap);
+	requireWorkspaceMap = envOrConfig(process.env.MEMCTX_REQUIRE_WORKSPACE_MAP, parseRequireWorkspaceMap(process.env.MEMCTX_REQUIRE_WORKSPACE_MAP), config.requireWorkspaceMap);
 	startupDoctorMode = envOrConfig(process.env.MEMCTX_STARTUP_DOCTOR, parseStartupDoctorMode(process.env.MEMCTX_STARTUP_DOCTOR), config.startupDoctor);
 	toolFailureHints = envOrConfig(process.env.MEMCTX_TOOL_FAILURE_HINTS, parseBooleanDefaultFalse(process.env.MEMCTX_TOOL_FAILURE_HINTS), config.toolFailureHints);
 	contextMode = envOrConfig(process.env.MEMCTX_CONTEXT_MODE, parseContextMode(process.env.MEMCTX_CONTEXT_MODE), config.contextMode);
@@ -446,6 +456,7 @@ function currentMemctxConfig(profile: MemctxProfile = currentProfile): MemctxCon
 		llm: llmMode,
 		autoSwitch: autoSwitchMode,
 		autoBootstrap: autoBootstrapMode,
+		requireWorkspaceMap,
 		startupDoctor: startupDoctorMode,
 		toolFailureHints,
 		contextMode,
@@ -690,6 +701,7 @@ export function detectActivePack(packsDir: string, cwd?: string): string | null 
 	const packs = listPacks(packsDir);
 	if (packs.length === 0) return null;
 
+	// Always honor explicit /memctx-init workspace mappings first.
 	if (cwd) {
 		const workspaceMatch = detectWorkspacePackForCwd(packsDir, cwd);
 		if (workspaceMatch) {
@@ -698,6 +710,10 @@ export function detectActivePack(packsDir: string, cwd?: string): string | null 
 			return workspaceMatch.pack;
 		}
 	}
+
+	// Strict opt-in: if we require an explicit workspace map, do not guess.
+	if (requireWorkspaceMap) return null;
+
 	if (packs.length === 1) return packs[0];
 
 	if (cwd) {
@@ -4796,6 +4812,9 @@ export function _setQmdAvailable(available: boolean) {
 export function _setStrictMode(enabled: boolean) {
 	strictMode = enabled;
 }
+export function _setRequireWorkspaceMap(enabled: boolean) {
+	requireWorkspaceMap = enabled;
+}
 export function _setContextPipelineForTest(pipeline: ContextPipeline) {
 	contextPipeline = pipeline;
 }
@@ -4831,7 +4850,8 @@ export default function (pi: ExtensionAPI) {
 			if (bootstrapped) {
 				packsDir = DEFAULT_GLOBAL_PACKS_DIR;
 			} else {
-				if (ctx.hasUI) {
+				// When strict opt-in is off, surface the original fallback message.
+				if (ctx.hasUI && !requireWorkspaceMap) {
 					ctx.ui.notify("memctx: No workspace memory found. Run /memctx-init to create one, or set MEMCTX_PACKS_PATH.", "info");
 				}
 				return;
@@ -4840,10 +4860,12 @@ export default function (pi: ExtensionAPI) {
 
 		vaultRoot = path.dirname(packsDir);
 		_packsDir = packsDir;
-		const detected = detectActivePack(packsDir, ["cwd", "all"].includes(autoSwitchMode) ? ctx.cwd : undefined);
+		// Always pass cwd so explicit /memctx-init workspace mappings are honored.
+		const detected = detectActivePack(packsDir, ctx.cwd);
 
 		if (!detected) {
-			if (ctx.hasUI) {
+			// When strict opt-in is off, surface the original fallback message.
+			if (ctx.hasUI && !requireWorkspaceMap) {
 				ctx.ui.notify("memctx: No memory packs found. Run `npm run new-pack` to create one.", "info");
 			}
 			return;

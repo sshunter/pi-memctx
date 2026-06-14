@@ -20,11 +20,11 @@
   "author": "Magno Oliveira <magnonta@outlook.com>",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/weauratech/pi-memctx.git"
+    "url": "git+https://github.com/sshunter/pi-memctx.git"
   },
-  "homepage": "https://github.com/weauratech/pi-memctx#readme",
+  "homepage": "https://github.com/sshunter/pi-memctx#readme",
   "bugs": {
-    "url": "https://github.com/weauratech/pi-memctx/issues"
+    "url": "https://github.com/sshunter/pi-memctx/issues"
   },
   "engines": {
     "node": ">=20"
