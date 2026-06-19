@@ -4840,6 +4840,24 @@ export function _resetState() {
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+	// Keep the memory tools available only while an active memory pack is resolved.
+	// Keys off activePackPath, so behavior is identical for either value of
+	// MEMCTX_REQUIRE_WORKSPACE_MAP: tools appear iff a pack is actually loaded.
+	function syncToolVisibility() {
+		const want = Boolean(activePackPath);
+		const active = pi.getActiveTools();
+		const hasSearch = active.includes("memctx_search");
+		const hasSave = active.includes("memctx_save");
+		if (want && (!hasSearch || !hasSave)) {
+			const next = new Set(active);
+			next.add("memctx_search");
+			next.add("memctx_save");
+			pi.setActiveTools([...next]);
+		} else if (!want && (hasSearch || hasSave)) {
+			pi.setActiveTools(active.filter((name) => name !== "memctx_search" && name !== "memctx_save"));
+		}
+	}
+
 	// --- session_start: detect vault, active pack, qmd ---
 	pi.on("session_start", async (_event, ctx) => {
 		applyMemctxConfig(readMemctxConfig());
@@ -4854,6 +4872,7 @@ export default function (pi: ExtensionAPI) {
 				if (ctx.hasUI && !requireWorkspaceMap) {
 					ctx.ui.notify("memctx: No workspace memory found. Run /memctx-init to create one, or set MEMCTX_PACKS_PATH.", "info");
 				}
+				syncToolVisibility();
 				return;
 			}
 		}
@@ -4868,6 +4887,7 @@ export default function (pi: ExtensionAPI) {
 			if (ctx.hasUI && !requireWorkspaceMap) {
 				ctx.ui.notify("memctx: No memory packs found. Run `npm run new-pack` to create one.", "info");
 			}
+			syncToolVisibility();
 			return;
 		}
 
@@ -4897,6 +4917,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			ctx.ui.setStatus("memctx", buildStatusText());
 		}
+		syncToolVisibility();
 	});
 
 	// --- before_agent_start: inject pack context ---
@@ -5192,6 +5213,7 @@ export default function (pi: ExtensionAPI) {
 				if (qmdAvailable) qmdEmbed(qmdCollection, activePackPath).catch(() => {});
 				ctx.ui.notify(`memctx: Linked workspace to existing memory "${slug}".`, "info");
 				ctx.ui.setStatus("memctx", buildStatusText());
+				syncToolVisibility();
 				return;
 			}
 			fs.rmSync(targetPackPath, { recursive: true });
@@ -5212,6 +5234,7 @@ export default function (pi: ExtensionAPI) {
 			"info",
 		);
 		ctx.ui.setStatus("memctx", buildStatusText());
+		syncToolVisibility();
 		await refreshWorkspaceMemory(scanDir, ctx, noDeep);
 	}
 
@@ -5431,8 +5454,14 @@ export default function (pi: ExtensionAPI) {
 
 			if (!activePackPath) {
 				return {
-					content: [{ type: "text" as const, text: "No active memory pack. Install a pack under packs/ first." }],
+					content: [
+						{
+							type: "text" as const,
+							text: "No active memory pack for this project. pi-memctx cannot create one automatically; the user can run /memctx-init to enable memory. Do not call memctx_search or memctx_save again this session.",
+						},
+					],
 					details: {},
+					isError: true,
 				};
 			}
 
@@ -5518,8 +5547,14 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!activePackPath || !activePack) {
 				return {
-					content: [{ type: "text" as const, text: "No active memory pack. Load a pack first." }],
+					content: [
+						{
+							type: "text" as const,
+							text: "No active memory pack for this project. pi-memctx cannot create one automatically; the user can run /memctx-init to enable memory. Do not call memctx_save or memctx_search again this session.",
+						},
+					],
 					details: {},
+					isError: true,
 				};
 			}
 
